@@ -614,7 +614,7 @@ void overlay_lighten_c(BYTE *p1Y, BYTE *p1U, BYTE *p1V, const BYTE *p2Y, const B
 // data, using the correct ÷max_val formula so that all mask values [0..max]
 // map linearly to the blend range without endpoint asymmetry.
 // ---------------------------------------------------------------------------
-template<typename pixel_t>
+template<typename pixel_t, bool has_separate_mask>
 static void masked_blend_packedrgba_c(
   BYTE* dstp8, const BYTE* ovrp8, const BYTE* maskp8,
   int dst_pitch, int ovr_pitch, int mask_pitch,
@@ -622,10 +622,11 @@ static void masked_blend_packedrgba_c(
 {
   pixel_t* dstp        = reinterpret_cast<pixel_t*>(dstp8);
   const pixel_t* ovrp  = reinterpret_cast<const pixel_t*>(ovrp8);
-  const pixel_t* maskp = reinterpret_cast<const pixel_t*>(maskp8);
+  const pixel_t* maskp = has_separate_mask ? reinterpret_cast<const pixel_t*>(maskp8) : nullptr;
   dst_pitch  /= sizeof(pixel_t);
   ovr_pitch  /= sizeof(pixel_t);
-  mask_pitch /= sizeof(pixel_t);
+  if constexpr (has_separate_mask)
+    mask_pitch /= sizeof(pixel_t);
 
   // For packed RGB32/64, only 8 and 16 bpc exist; bpp derives from pixel_t.
   constexpr uint32_t max_val = sizeof(pixel_t) == 1 ? 255u : 65535u;
@@ -639,7 +640,7 @@ static void masked_blend_packedrgba_c(
 
   for (int y = 0; y < height; ++y) {
     for (int x = 0; x < width; ++x) {
-      const uint32_t alpha_src = maskp ? (uint32_t)maskp[x] : (uint32_t)ovrp[x * 4 + 3];
+      const uint32_t alpha_src = has_separate_mask ? (uint32_t)maskp[x] : (uint32_t)ovrp[x * 4 + 3];
       const uint32_t alpha_eff = (uint32_t)magic_div_rt<pixel_t>(
         alpha_src * (uint32_t)opacity_i + half, magic);
       const uint32_t inv_alpha = max_val - alpha_eff;
@@ -651,7 +652,7 @@ static void masked_blend_packedrgba_c(
     }
     dstp += dst_pitch;
     ovrp += ovr_pitch;
-    if (maskp) maskp += mask_pitch;
+    if constexpr (has_separate_mask) maskp += mask_pitch;
   }
 }
 

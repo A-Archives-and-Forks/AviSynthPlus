@@ -1982,12 +1982,16 @@ Layer::Layer(PClip _child1, PClip _child2, PClip _mask_child, const char _op[], 
   // After pre-conversion in Create (when mode is non-"Add"/"Subtract", packed RGB32/64
   // normally appear here as PlanarRGBA (non-native path).
   // For the native packed path (Add/Subtract with use_chroma=true),
-  // vi2 stays as RGB32/RGB64 and hasAlpha stays false; the packed blend kernel reads
-  // alpha directly from the interleaved pixel or from a separate mask_child clip.
-  hasAlpha = vi2.IsYUVA() || vi2.IsPlanarRGBA();
+  // vi2 stays as RGB32, we still fill hasAlpha for the level->opacity calc;
+  // however the packed RGB32 (kept for speed reasons) blend kernel reads alpha directly.
+  // RGB32 'add' + chroma=true uses magicdiv and opacity in their calc
+  // Or from a separate mask_child clip.
+  hasAlpha = vi2.IsYUVA() || vi2.IsPlanarRGBA() || vi2.IsRGB32() || vi2.IsRGB64();
+
   // process_alpha_channel: both clips have an alpha plane → blend A exactly like the colour
   // channels (same op formula).  This reproduces the historical RGB32 behaviour where the
   // MMX code applied the blend uniformly across all four packed bytes including alpha.
+  // Used for planar rgb part, legacy packed rgb32 is working like this by default.
   process_alpha_channel = hasAlpha && (vi1.IsYUVA() || vi1.IsPlanarRGBA());
   bits_per_pixel = vi.BitsPerComponent();
 
@@ -2013,6 +2017,15 @@ Layer::Layer(PClip _child1, PClip _child2, PClip _mask_child, const char _op[], 
     opacity = 1.0f;
 
   if ((vi.IsYUV() || vi.IsYUVA()) && !vi.IsY()) {
+    // make offsets subsampling friendly
+    ofsX = ofsX & ~((1 << vi.GetPlaneWidthSubsampling(PLANAR_U)) - 1);
+    ofsY = ofsY & ~((1 << vi.GetPlaneHeightSubsampling(PLANAR_U)) - 1);
+  }
+
+  // For the sake of completeness, packed rgb formats still exist, but for most modes they are converted to planar RGB.
+  if (vi.IsRGB32() || vi.IsRGB64() || vi.IsRGB24() || vi.IsRGB48())
+    ofsY = vi.height - vi2.height - ofsY; // packed RGB is upside down
+  else if ((vi.IsYUV() || vi.IsYUVA()) && !vi.IsY()) {
     // make offsets subsampling friendly
     ofsX = ofsX & ~((1 << vi.GetPlaneWidthSubsampling(PLANAR_U)) - 1);
     ofsY = ofsY & ~((1 << vi.GetPlaneHeightSubsampling(PLANAR_U)) - 1);
@@ -2340,6 +2353,10 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
     // note: ThresholdParam is not scaled automatically
     int thresh = std::max(0, std::min(ThresholdParam, (1 << bits_per_pixel) - 1)); // limit threshold, old method was: & 0xFF
 
+    // only "Add" and "Subtract" is live code for RGB32/64, others are preconverted to planar RGBA in Create.
+    // Kept for reference.
+
+    // packed rgb "Mul": dead code, kept for reference
     if (!lstrcmpi(Op, "Mul"))
     {
       if (chroma)
@@ -2399,6 +2416,8 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
     {
       if (chroma)
       {
+        // packed rgb "Add" + chroma=true: NOT dead code, kept for speed, too many scripts are using
+
         // Packed RGBA Add/chroma (and pre-inverted Subtract/chroma):
         // overlay alpha acts as per-pixel blend weight, or a separate mask
         // clip supplies the original alpha when the overlay was pre-inverted.
@@ -2421,16 +2440,17 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
 
         layer_packedrgb_blend_c_t* blend_fn;
 #ifdef INTEL_INTRINSICS
-        if (pixelsize == 1 && (env->GetCPUFlags() & CPUF_AVX2))
+        // for 8+ bits these may return the C reference, but compiled with avx2/sse4.1 arch.
+        if ((env->GetCPUFlags() & CPUF_AVX2))
           get_layer_packedrgb_blend_functions_avx2(has_separate_mask, bits_per_pixel, &blend_fn);
-        else if (pixelsize == 1 && (env->GetCPUFlags() & CPUF_SSE4_1))
+        else if ((env->GetCPUFlags() & CPUF_SSE4_1))
           get_layer_packedrgb_blend_functions_sse41(has_separate_mask, bits_per_pixel, &blend_fn);
         else
 #endif
-          get_layer_packedrgb_blend_functions(bits_per_pixel, &blend_fn);
+          get_layer_packedrgb_blend_functions(has_separate_mask, bits_per_pixel, &blend_fn);
         blend_fn(src1p, src2p, maskp8, src1_pitch, src2_pitch, maskpitch, width, height, opacity_i);
       }
-      else // Add, chroma == false
+      else // Add, chroma == false, Special "Layer" case, not a simple MaskedMerge.
       {
 #ifdef INTEL_INTRINSICS
         if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_AVX2))
@@ -2457,6 +2477,7 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
         }
       }
     }
+    // packed rgb "Mul": dead code, kept for reference
     if (!lstrcmpi(Op, "Lighten"))
     {
       // Copy overlay_clip over base_clip in areas where overlay_clip is lighter by threshold.
@@ -2485,6 +2506,7 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
           layer_rgb32_lighten_darken_c<LIGHTEN, uint16_t>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel, thresh);
       }
     }
+    // packed rgb "Mul": dead code, kept for reference
     if (!lstrcmpi(Op, "Darken"))
     {
       // Copy overlay_clip over base_clip in areas where overlay_clip is darker by threshold.

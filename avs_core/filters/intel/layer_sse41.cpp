@@ -199,7 +199,7 @@ void get_layer_packedrgb_blend_functions_sse41(
                             : masked_blend_packedrgba_sse41_u8<false>;
     return;
   }
-  get_layer_packedrgb_blend_functions(bits_per_pixel, fn);
+  get_layer_packedrgb_blend_functions(has_separate_mask, bits_per_pixel, fn);
 }
 
 // ---------------------------------------------------------------------------

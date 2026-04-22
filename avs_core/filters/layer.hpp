@@ -1419,13 +1419,14 @@ static void get_layer_planarrgb_mul_functions(
 // maskp8 null-check, so a single function covers both Add and Subtract.
 // ---------------------------------------------------------------------------
 static void get_layer_packedrgb_blend_functions(
+  bool has_separate_mask,
   int bits_per_pixel,
   layer_packedrgb_blend_c_t** fn)
 {
   if (bits_per_pixel == 8)
-    *fn = masked_blend_packedrgba_c<uint8_t>;
+    *fn = has_separate_mask ?  masked_blend_packedrgba_c<uint8_t, true> : masked_blend_packedrgba_c<uint8_t, false>;
   else  // 16-bit (RGB64)
-    *fn = masked_blend_packedrgba_c<uint16_t>;
+    *fn = has_separate_mask ?  masked_blend_packedrgba_c<uint16_t, true> : masked_blend_packedrgba_c<uint16_t, false>;
 }
 
 // Clean up rowprep macros (defined near top of this file or by including TU).

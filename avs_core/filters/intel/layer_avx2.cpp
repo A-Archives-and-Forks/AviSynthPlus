@@ -355,6 +355,7 @@ void get_layer_yuv_add_functions_avx2(
 
 
 void get_layer_planarrgb_lighten_darken_functions_avx2(bool isLighten, bool hasAlpha, bool blendAlpha, int bits_per_pixel, /*out*/layer_planarrgb_lighten_darken_c_t** layer_fn, /*out*/layer_planarrgb_lighten_darken_f_c_t** layer_f_fn) {
+  // FIXME: add AVX2 see layer_rgb32_lighten_darken_avx2
   get_layer_planarrgb_lighten_darken_functions(isLighten, hasAlpha, blendAlpha, bits_per_pixel, layer_fn, layer_f_fn);
 }
 
@@ -556,7 +557,7 @@ void get_layer_packedrgb_blend_functions_avx2(
                             : masked_blend_packedrgba_avx2_u8<false>;
     return;
   }
-  get_layer_packedrgb_blend_functions(bits_per_pixel, fn);
+  get_layer_packedrgb_blend_functions(has_separate_mask, bits_per_pixel, fn);
 }
 
 
