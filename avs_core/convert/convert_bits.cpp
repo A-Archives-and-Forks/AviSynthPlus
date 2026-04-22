@@ -622,13 +622,18 @@ static void convert_uint_limited_c(const BYTE* srcp, BYTE* dstp, int src_rowsize
     const int shift_bits = source_bitdepth - target_bitdepth;
     const int round = 1 << (shift_bits - 1);
 
-    const int target_max = (1 << target_bitdepth) - 1;
-    constexpr auto target_min = 0;
+    const pixel_t_d target_max = (1 << target_bitdepth) - 1;
+    const pixel_t_s source_max = (1 << source_bitdepth) - 1;
 
     for (int y = 0; y < src_height; y++)
     {
+      const pixel_t_s* AVS_RESTRICT s = srcp0;
+      pixel_t_d* AVS_RESTRICT d = dstp0;
+
       for (int x = 0; x < src_width; x++) {
-        dstp0[x] = clamp((srcp0[x] + round) >> shift_bits, target_min, target_max);;  // reduce range
+        int val = static_cast<int>(s[x]) + round;
+        if (val > source_max) val = source_max; // no saturated add in C
+        d[x] = static_cast<pixel_t_d>(val >> shift_bits);
       }
       dstp0 += dst_pitch;
       srcp0 += src_pitch;
