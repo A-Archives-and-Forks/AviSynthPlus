@@ -363,6 +363,7 @@ PVideoFrame __stdcall PlanarRGBtoPackedRGB::GetFrame(int n, IScriptEnvironment* 
   conv_fn_t fn = nullptr;
 
 #ifdef INTEL_INTRINSICS
+  const bool hasAVX2 = (env->GetCPUFlags() & CPUF_AVX2) != 0;
   const bool hasSSE2 = (env->GetCPUFlags() & CPUF_SSE2) != 0;
 #endif
 
@@ -372,7 +373,9 @@ PVideoFrame __stdcall PlanarRGBtoPackedRGB::GetFrame(int n, IScriptEnvironment* 
     }
     else {  // RGBA32
 #ifdef INTEL_INTRINSICS
-      if (hasSSE2)
+      if (hasAVX2)
+        fn = hasSrcAlpha ? convert_rgbp_to_rgba_avx2<uint8_t, true> : convert_rgbp_to_rgba_avx2<uint8_t, false>;
+      else if (hasSSE2)
         fn = hasSrcAlpha ? convert_rgbp_to_rgba_sse2<uint8_t, true> : convert_rgbp_to_rgba_sse2<uint8_t, false>;
       else
 #endif
@@ -385,7 +388,9 @@ PVideoFrame __stdcall PlanarRGBtoPackedRGB::GetFrame(int n, IScriptEnvironment* 
     }
     else {  // RGBA64
 #ifdef INTEL_INTRINSICS
-      if (hasSSE2)
+      if (hasAVX2)
+        fn = hasSrcAlpha ? convert_rgbp_to_rgba_avx2<uint16_t, true> : convert_rgbp_to_rgba_avx2<uint16_t, false>;
+      else if (hasSSE2)
         fn = hasSrcAlpha ? convert_rgbp_to_rgba_sse2<uint16_t, true> : convert_rgbp_to_rgba_sse2<uint16_t, false>;
       else
 #endif

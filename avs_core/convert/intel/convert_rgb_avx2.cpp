@@ -242,3 +242,116 @@ template void convert_rgba_to_rgbp_avx2<uint8_t, false>(const BYTE* srcp, BYTE* 
 template void convert_rgba_to_rgbp_avx2<uint8_t, true>(const BYTE* srcp, BYTE* (&dstp)[4], int src_pitch, int(&dst_pitch)[4], int width, int height);
 template void convert_rgba_to_rgbp_avx2<uint16_t, false>(const BYTE* srcp, BYTE* (&dstp)[4], int src_pitch, int(&dst_pitch)[4], int width, int height);
 template void convert_rgba_to_rgbp_avx2<uint16_t, true>(const BYTE* srcp, BYTE* (&dstp)[4], int src_pitch, int(&dst_pitch)[4], int width, int height);
+
+// Planar RGB(A) → packed RGBA32/RGBA64  (reverse of convert_rgba_to_rgbp_avx2)
+//
+// Main loop: 128 bytes written per iteration
+//   uint8_t:  32 pixels → 4 × _mm256_store_si256
+//   uint16_t: 16 pixels → 4 × _mm256_store_si256
+// Tail: 64 bytes (one half-iteration, uses SSE2 128-bit stores)
+//   uint8_t:  16 pixels → 4 × _mm_store_si128
+//   uint16_t:  8 pixels → 4 × _mm_store_si128
+//
+// Scanline alignment is 64 bytes (Avisynth guarantee), so no remainder
+// handling is needed beyond the one optional 64-byte tail.  Width is
+// assumed to be a multiple of 16 (uint8_t) / 8 (uint16_t) — the same
+// constraint as convert_rgba_to_rgbp_avx2.
+
+template<typename pixel_t, bool hasSrcAlpha>
+void convert_rgbp_to_rgba_avx2(const BYTE* (&srcp)[4], BYTE* dstp, int(&src_pitch)[4], int dst_pitch, int width, int height)
+{
+  // big: pixels processed per 128-byte iteration; small: 64-byte tail size
+  constexpr int big_pixels   = (sizeof(pixel_t) == 1) ? 32 : 16;
+  constexpr int small_pixels = big_pixels / 2;  // 16 (u8) or 8 (u16)
+  const int wmod = (width / big_pixels) * big_pixels;
+
+  const __m256i transparent256 = _mm256_set1_epi8((char)0xFF);
+  const __m128i transparent128 = _mm_set1_epi8((char)0xFF);
+
+  for (int y = 0; y < height; y++) {
+    // main loop: 128 bytes output per iteration
+    for (int x = 0; x < wmod; x += big_pixels) {
+      __m256i G = _mm256_load_si256(reinterpret_cast<const __m256i*>(srcp[0] + x * sizeof(pixel_t)));
+      __m256i B = _mm256_load_si256(reinterpret_cast<const __m256i*>(srcp[1] + x * sizeof(pixel_t)));
+      __m256i R = _mm256_load_si256(reinterpret_cast<const __m256i*>(srcp[2] + x * sizeof(pixel_t)));
+      __m256i A;
+      if constexpr (hasSrcAlpha)
+        A = _mm256_load_si256(reinterpret_cast<const __m256i*>(srcp[3] + x * sizeof(pixel_t)));
+      else
+        A = transparent256;
+
+      __m256i u0, u1, u2, u3;
+      if constexpr (sizeof(pixel_t) == 1) {
+        __m256i BG_lo = _mm256_unpacklo_epi8(B, G);
+        __m256i BG_hi = _mm256_unpackhi_epi8(B, G);
+        __m256i RA_lo = _mm256_unpacklo_epi8(R, A);
+        __m256i RA_hi = _mm256_unpackhi_epi8(R, A);
+        u0 = _mm256_unpacklo_epi16(BG_lo, RA_lo);  // [px 0-3  | px16-19]
+        u1 = _mm256_unpackhi_epi16(BG_lo, RA_lo);  // [px 4-7  | px20-23]
+        u2 = _mm256_unpacklo_epi16(BG_hi, RA_hi);  // [px 8-11 | px24-27]
+        u3 = _mm256_unpackhi_epi16(BG_hi, RA_hi);  // [px12-15 | px28-31]
+      } else {
+        __m256i BG_lo = _mm256_unpacklo_epi16(B, G);
+        __m256i BG_hi = _mm256_unpackhi_epi16(B, G);
+        __m256i RA_lo = _mm256_unpacklo_epi16(R, A);
+        __m256i RA_hi = _mm256_unpackhi_epi16(R, A);
+        u0 = _mm256_unpacklo_epi32(BG_lo, RA_lo);  // [px 0-1  | px 8-9 ]
+        u1 = _mm256_unpackhi_epi32(BG_lo, RA_lo);  // [px 2-3  | px10-11]
+        u2 = _mm256_unpacklo_epi32(BG_hi, RA_hi);  // [px 4-5  | px12-13]
+        u3 = _mm256_unpackhi_epi32(BG_hi, RA_hi);  // [px 6-7  | px14-15]
+      }
+      BYTE* d = dstp + x * 4 * sizeof(pixel_t);
+      _mm256_store_si256(reinterpret_cast<__m256i*>(d +  0), _mm256_permute2x128_si256(u0, u1, 0x20));
+      _mm256_store_si256(reinterpret_cast<__m256i*>(d + 32), _mm256_permute2x128_si256(u2, u3, 0x20));
+      _mm256_store_si256(reinterpret_cast<__m256i*>(d + 64), _mm256_permute2x128_si256(u0, u1, 0x31));
+      _mm256_store_si256(reinterpret_cast<__m256i*>(d + 96), _mm256_permute2x128_si256(u2, u3, 0x31));
+    }
+
+    // tail: 64 bytes output (at most one, since width % big = small or 0)
+    if (wmod < width) {
+      const int tx = wmod;
+      __m128i tG = _mm_load_si128(reinterpret_cast<const __m128i*>(srcp[0] + tx * sizeof(pixel_t)));
+      __m128i tB = _mm_load_si128(reinterpret_cast<const __m128i*>(srcp[1] + tx * sizeof(pixel_t)));
+      __m128i tR = _mm_load_si128(reinterpret_cast<const __m128i*>(srcp[2] + tx * sizeof(pixel_t)));
+      __m128i tA;
+      if constexpr (hasSrcAlpha)
+        tA = _mm_load_si128(reinterpret_cast<const __m128i*>(srcp[3] + tx * sizeof(pixel_t)));
+      else
+        tA = transparent128;
+
+      BYTE* d = dstp + tx * 4 * sizeof(pixel_t);
+      if constexpr (sizeof(pixel_t) == 1) {
+        __m128i BG_lo = _mm_unpacklo_epi8(tB, tG);
+        __m128i BG_hi = _mm_unpackhi_epi8(tB, tG);
+        __m128i RA_lo = _mm_unpacklo_epi8(tR, tA);
+        __m128i RA_hi = _mm_unpackhi_epi8(tR, tA);
+        _mm_store_si128(reinterpret_cast<__m128i*>(d +  0), _mm_unpacklo_epi16(BG_lo, RA_lo));  // px tx+0..3
+        _mm_store_si128(reinterpret_cast<__m128i*>(d + 16), _mm_unpackhi_epi16(BG_lo, RA_lo));  // px tx+4..7
+        _mm_store_si128(reinterpret_cast<__m128i*>(d + 32), _mm_unpacklo_epi16(BG_hi, RA_hi));  // px tx+8..11
+        _mm_store_si128(reinterpret_cast<__m128i*>(d + 48), _mm_unpackhi_epi16(BG_hi, RA_hi));  // px tx+12..15
+      } else {
+        __m128i BG_lo = _mm_unpacklo_epi16(tB, tG);
+        __m128i BG_hi = _mm_unpackhi_epi16(tB, tG);
+        __m128i RA_lo = _mm_unpacklo_epi16(tR, tA);
+        __m128i RA_hi = _mm_unpackhi_epi16(tR, tA);
+        _mm_store_si128(reinterpret_cast<__m128i*>(d +  0), _mm_unpacklo_epi32(BG_lo, RA_lo));  // px tx+0..1
+        _mm_store_si128(reinterpret_cast<__m128i*>(d + 16), _mm_unpackhi_epi32(BG_lo, RA_lo));  // px tx+2..3
+        _mm_store_si128(reinterpret_cast<__m128i*>(d + 32), _mm_unpacklo_epi32(BG_hi, RA_hi));  // px tx+4..5
+        _mm_store_si128(reinterpret_cast<__m128i*>(d + 48), _mm_unpackhi_epi32(BG_hi, RA_hi));  // px tx+6..7
+      }
+    }
+
+    dstp -= dst_pitch;
+    srcp[0] += src_pitch[0];
+    srcp[1] += src_pitch[1];
+    srcp[2] += src_pitch[2];
+    if constexpr (hasSrcAlpha)
+      srcp[3] += src_pitch[3];
+  }
+}
+
+// Instantiate them
+template void convert_rgbp_to_rgba_avx2<uint8_t, false>(const BYTE* (&srcp)[4], BYTE* dstp, int(&src_pitch)[4], int dst_pitch, int width, int height);
+template void convert_rgbp_to_rgba_avx2<uint8_t, true>(const BYTE* (&srcp)[4], BYTE* dstp, int(&src_pitch)[4], int dst_pitch, int width, int height);
+template void convert_rgbp_to_rgba_avx2<uint16_t, false>(const BYTE* (&srcp)[4], BYTE* dstp, int(&src_pitch)[4], int dst_pitch, int width, int height);
+template void convert_rgbp_to_rgba_avx2<uint16_t, true>(const BYTE* (&srcp)[4], BYTE* dstp, int(&src_pitch)[4], int dst_pitch, int width, int height);

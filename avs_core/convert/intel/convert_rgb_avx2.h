@@ -43,4 +43,7 @@ void convert_rgb_to_rgbp_avx2(const BYTE *srcp, BYTE * (&dstp)[4], int src_pitch
 template<typename pixel_t, bool targetHasAlpha>
 void convert_rgba_to_rgbp_avx2(const BYTE* srcp, BYTE* (&dstp)[4], int src_pitch, int(&dst_pitch)[4], int width, int height);
 
+template<typename pixel_t, bool hasSrcAlpha>
+void convert_rgbp_to_rgba_avx2(const BYTE* (&srcp)[4], BYTE* dstp, int(&src_pitch)[4], int dst_pitch, int width, int height);
+
 #endif  // __Convert_RGB_AVX2_H__
