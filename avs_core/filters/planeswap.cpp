@@ -47,6 +47,7 @@
 #include "planeswap.h"
 #ifdef INTEL_INTRINSICS
 #include "intel/planeswap_sse.h"
+#include "intel/planeswap_avx2.h"
 #endif
 #include "../core/internal.h"
 #include <algorithm>
@@ -198,16 +199,9 @@ AVSValue __cdecl SwapUVToY::CreateAnyToY8(AVSValue args, void* user_data, IScrip
 {
   int mode = (int)(intptr_t)(user_data);
   PClip clip = args[0].AsClip();
-  const VideoInfo& vi_input = clip->GetVideoInfo();
 
-  // 161205: Packed RGB PlaneToY("R"),g,b,a or ExtractR,G,B,A
-  // A generic way for using these PlaneToY() or Extract... functions for packed RGB types
-  // We convert them to planar RGB (R,G,B plane reqest) or planar RGBA (only if A plane requested)
-  if (vi_input.IsRGB() && !vi_input.IsPlanarRGB() && !vi_input.IsPlanarRGBA()) {
-    if (mode == AToY8 || mode == RToY8 || mode == GToY8 || mode == BToY8) {
-      clip = new PackedRGBtoPlanarRGB(clip, vi_input.IsRGB32() || vi_input.IsRGB64(), mode == AToY8);
-    }
-  }
+  // Packed RGB (RGB24/32/48/64): pass directly to SwapUVToY; GetFrame handles
+  // channel extraction with correct bottom-up row order.  No planar conversion needed.
 
   if(clip->GetVideoInfo().IsYUY2() && mode == YToY8)
     return new ConvertYUY2ToYV16_or_Y(clip, true /*to_y*/, env);
@@ -246,14 +240,16 @@ SwapUVToY::SwapUVToY(PClip _child, int _mode, IScriptEnvironment* env)
   bool RGBmode = mode == RToY8 || mode == GToY8 || mode == BToY8;
   bool Alphamode = mode == AToY8;
 
-  if(!vi.IsYUVA() && !vi.IsPlanarRGBA() && Alphamode)
+  // RGB32/64 are packed RGBA; RGB24/48 have no alpha channel.
+  if(!vi.IsYUVA() && !vi.IsPlanarRGBA() && !(vi.IsRGB32() || vi.IsRGB64()) && Alphamode)
       env->ThrowError("PlaneToY: Clip has no Alpha channel!");
 
   if (!vi.IsYUV() && !vi.IsYUVA() && YUVmode )
     env->ThrowError("PlaneToY: clip is not YUV!");
 
-  if (!vi.IsPlanarRGB() && !vi.IsPlanarRGBA() && RGBmode )
-      env->ThrowError("PlaneToY: clip is not planar RGB!");
+  // IsRGB() covers both packed (RGB24/32/48/64) and planar RGB/RGBA.
+  if (!vi.IsRGB() && RGBmode)
+      env->ThrowError("PlaneToY: clip is not RGB!");
 
   if (vi.NumComponents() == 1 && mode != YToY8)
     env->ThrowError("PlaneToY: channel cannot be extracted from a greyscale clip!");
@@ -280,8 +276,119 @@ SwapUVToY::SwapUVToY(PClip _child, int _mode, IScriptEnvironment* env)
 PVideoFrame __stdcall SwapUVToY::GetFrame(int n, IScriptEnvironment* env)
 {
   PVideoFrame src = child->GetFrame(n, env);
+  const VideoInfo& src_vi = child->GetVideoInfo();
 
-  bool NonYUY2toY8 = true;
+  // -----------------------------------------------------------------------
+  // Packed RGB (RGB24/32/48/64) channel extraction.
+  // Packed RGB is stored bottom-up; the Subframe offset trick used for
+  // planar formats does not apply here.  We iterate rows in reverse order
+  // from the source while writing top-down into the Y-only destination.
+  // -----------------------------------------------------------------------
+  if (src_vi.IsRGB() && !src_vi.IsPlanarRGB() && !src_vi.IsPlanarRGBA()) {
+    PVideoFrame dst = env->NewVideoFrameP(vi, &src);
+    const int height = vi.height;
+    const int width  = vi.width;
+    const int pixelsize      = src_vi.ComponentSize();   // 1 (8-bit) or 2 (16-bit)
+    const int src_components = src_vi.NumComponents();   // 3 (RGB24/48) or 4 (RGB32/64)
+
+    // Byte offset of the requested channel within one packed pixel.
+    // Memory order: B=0, G=1, R=2, A=3 (each occupies pixelsize bytes).
+    int channel_index;
+    switch (mode) {
+    case BToY8: channel_index = 0; break;
+    case GToY8: channel_index = 1; break;
+    case RToY8: channel_index = 2; break;
+    default /*AToY8*/: channel_index = 3; break;
+    }
+    const int byte_offset   = channel_index * pixelsize;
+    const int pixel_stride  = src_components * pixelsize; // bytes between adjacent pixels
+
+    const BYTE* srcp_bottom = src->GetReadPtr()
+                              + static_cast<ptrdiff_t>(src->GetPitch()) * (height - 1);
+    const int src_pitch  = src->GetPitch();
+    BYTE*     dstp_base  = dst->GetWritePtr();
+    const int dst_pitch  = dst->GetPitch();
+
+#ifdef INTEL_INTRINSICS
+    const bool avx2 = (env->GetCPUFlags() & CPUF_AVX2) != 0;
+    const bool sse2 = (env->GetCPUFlags() & CPUF_SSE2) != 0;
+    if (avx2 && (src_vi.IsRGB32() || src_vi.IsRGB64())) {
+      if (src_vi.IsRGB32()) {
+        switch (channel_index) {
+        case 0: extract_packed_rgb32_channel_avx2<0>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+        case 1: extract_packed_rgb32_channel_avx2<1>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+        case 2: extract_packed_rgb32_channel_avx2<2>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+        case 3: extract_packed_rgb32_channel_avx2<3>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+        }
+      } else { // RGB64
+        switch (channel_index) {
+        case 0: extract_packed_rgb64_channel_avx2<0>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+        case 1: extract_packed_rgb64_channel_avx2<1>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+        case 2: extract_packed_rgb64_channel_avx2<2>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+        case 3: extract_packed_rgb64_channel_avx2<3>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+        }
+      }
+    } else if (avx2 && src_vi.IsRGB24() && channel_index <= 2 && width >= 32) {
+      // RGB24 AVX2: 32 pixels/iter; needs width >= 32 for the overlap-remainder to be valid.
+      switch (channel_index) {
+      case 0: extract_packed_rgb_noalpha_channel_avx2<uint8_t, 0>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+      case 1: extract_packed_rgb_noalpha_channel_avx2<uint8_t, 1>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+      case 2: extract_packed_rgb_noalpha_channel_avx2<uint8_t, 2>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+      }
+    } else if (avx2 && src_vi.IsRGB48() && channel_index <= 2 && width >= 16) {
+      // RGB48 AVX2: 16 pixels/iter; needs width >= 16 for the overlap-remainder to be valid.
+      switch (channel_index) {
+      case 0: extract_packed_rgb_noalpha_channel_avx2<uint16_t, 0>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+      case 1: extract_packed_rgb_noalpha_channel_avx2<uint16_t, 1>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+      case 2: extract_packed_rgb_noalpha_channel_avx2<uint16_t, 2>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+      }
+    } else if (sse2 && (src_vi.IsRGB32() || src_vi.IsRGB64())) {
+      if (src_vi.IsRGB32()) {
+        switch (channel_index) {
+        case 0: extract_packed_rgb32_channel_sse2<0>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+        case 1: extract_packed_rgb32_channel_sse2<1>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+        case 2: extract_packed_rgb32_channel_sse2<2>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+        case 3: extract_packed_rgb32_channel_sse2<3>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+        }
+      } else { // RGB64
+        switch (channel_index) {
+        case 0: extract_packed_rgb64_channel_sse2<0>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+        case 1: extract_packed_rgb64_channel_sse2<1>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+        case 2: extract_packed_rgb64_channel_sse2<2>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+        case 3: extract_packed_rgb64_channel_sse2<3>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+        }
+      }
+    } else
+#endif
+    { // C fallback (RGB24/48 without AVX2, RGB32/64 without SSE2, or small widths)
+      const BYTE* srcp = srcp_bottom + byte_offset;
+      BYTE*       dstp = dstp_base;
+      if (pixelsize == 1) {
+        for (int y = 0; y < height; ++y) {
+          for (int x = 0; x < width; ++x)
+            dstp[x] = srcp[x * pixel_stride];
+          srcp -= src_pitch;
+          dstp += dst_pitch;
+        }
+      } else { // pixelsize == 2 (RGB48 / RGB64)
+        for (int y = 0; y < height; ++y) {
+          uint16_t* dstp16 = reinterpret_cast<uint16_t*>(dstp);
+          for (int x = 0; x < width; ++x)
+            dstp16[x] = *reinterpret_cast<const uint16_t*>(srcp + x * pixel_stride);
+          srcp -= src_pitch;
+          dstp += dst_pitch;
+        }
+      }
+    }
+
+    auto props = env->getFramePropsRW(dst);
+    env->propDeleteKey(props, "_ChromaLocation");
+    if (mode == AToY8)
+      env->propSetInt(props, "_ColorRange", ColorRange_Compat_e::AVS_COLORRANGE_FULL, AVSPropAppendMode::PROPAPPENDMODE_REPLACE);
+    return dst;
+  }
+
+  bool NonYUY2orPackedRGBtoY8 = true;
   int target_plane, source_plane;
   switch (mode) {
   case YToY8: source_plane = PLANAR_Y; target_plane = PLANAR_Y; break;
@@ -291,9 +398,9 @@ PVideoFrame __stdcall SwapUVToY::GetFrame(int n, IScriptEnvironment* env)
   case GToY8: source_plane = PLANAR_G; target_plane = PLANAR_G; break;
   case BToY8: source_plane = PLANAR_B; target_plane = PLANAR_G; break;
   case AToY8: source_plane = PLANAR_A; target_plane = vi.IsYUVA() ? PLANAR_Y : PLANAR_G; break; // Planar RGB: GBR!
-  default: NonYUY2toY8 = false;
+  default: NonYUY2orPackedRGBtoY8 = false;
   }
-  if (NonYUY2toY8) {
+  if (NonYUY2orPackedRGBtoY8) {
     // !! if offsets would be size_t, be cautious when you subtract two unsigned size_t variables
     const int offset = src->GetOffset(source_plane) - src->GetOffset(target_plane); // very naughty - don't do this at home!!
                                                                                     // Abuse Subframe to snatch the U/V/R/G/B/A plane

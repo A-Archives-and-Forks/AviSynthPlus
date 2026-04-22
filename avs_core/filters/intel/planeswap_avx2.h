@@ -32,37 +32,28 @@
 // which is not derived from or based on Avisynth, such as 3rd-party filters,
 // import and export plugins, or graphical user interfaces.
 
+#ifndef __Planeswap_AVX2_H__
+#define __Planeswap_AVX2_H__
 
-// Avisynth filter: Plane Swap
-// by Klaus Post
+#include <avs/types.h>
 
-
-
-#ifndef __Planeswap_SSE_H__
-#define __Planeswap_SSE_H__
-
-#include <avisynth.h>
-
-#ifdef X86_32
-void yuy2_swap_isse(const BYTE* srcp, BYTE* dstp, int src_pitch, int dst_pitch, int width, int height);
-#endif
-void yuy2_swap_sse2(const BYTE* srcp, BYTE* dstp, int src_pitch, int dst_pitch, int width, int height);
-#if defined(GCC) || defined(CLANG)
-__attribute__((__target__("ssse3")))
-#endif
-void yuy2_swap_ssse3(const BYTE* srcp, BYTE* dstp, int src_pitch, int dst_pitch, int width, int height);
-
-void yuy2_uvtoy_sse2(const BYTE* srcp, BYTE* dstp, int src_pitch, int dst_pitch, int dst_width, int height, int pos);
-void yuy2_uvtoy8_sse2(const BYTE* srcp, BYTE* dstp, int src_pitch, int dst_pitch, int dst_width, int height, int pos);
-
-template <bool has_clipY>
-void yuy2_ytouv_sse2(const BYTE* srcp_y, const BYTE* srcp_u, const BYTE* srcp_v, BYTE* dstp, int pitch_y, int pitch_u, int pitch_v, int dst_pitch, int dst_rowsize, int height);
-
-// Packed RGB32/RGB64 single-channel extraction
+// Packed RGB32/RGB64 single-channel extraction — AVX2.
+// srcp: last (bottom) row of source.  Pitch is positive; each row
+// steps srcp -= src_pitch upward.  channel_index: B=0 G=1 R=2 A=3.
+// Width must be a multiple of 16 (RGB32) / 8 (RGB64) — guaranteed by 64-byte alignment.
 template<int channel_index>
-void extract_packed_rgb32_channel_sse2(const BYTE* srcp, BYTE* dstp, int src_pitch, int dst_pitch, int width, int height);
+void extract_packed_rgb32_channel_avx2(const BYTE* srcp, BYTE* dstp, int src_pitch, int dst_pitch, int width, int height);
 
 template<int channel_index>
-void extract_packed_rgb64_channel_sse2(const BYTE* srcp, BYTE* dstp, int src_pitch, int dst_pitch, int width, int height);
+void extract_packed_rgb64_channel_avx2(const BYTE* srcp, BYTE* dstp, int src_pitch, int dst_pitch, int width, int height);
 
-#endif  // __Planeswap_SSE_H__
+// Packed RGB24/RGB48 single-channel extraction — AVX2.
+// pixel_t = uint8_t (RGB24) or uint16_t (RGB48).  channel_index: B=0 G=1 R=2.
+// Processes 32 pixels (RGB24) or 16 pixels (RGB48) per main iteration, both consuming
+// 96 source bytes.  Caller must ensure width >= 32 (RGB24) or >= 16 (RGB48).
+// Remainder (width not a multiple of pixels_per_iter) handled by overlapping re-run.
+#include <cstdint>
+template<typename pixel_t, int channel_index>
+void extract_packed_rgb_noalpha_channel_avx2(const BYTE* srcp, BYTE* dstp, int src_pitch, int dst_pitch, int width, int height);
+
+#endif  // __Planeswap_AVX2_H__
