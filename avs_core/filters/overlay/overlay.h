@@ -92,6 +92,8 @@ private:
 
   const char* output_pixel_format_override;
 
+  int placement; // PLACEMENT_MPEG2 (default) or PLACEMENT_MPEG1
+
   bool isInternalRGB; // must be planar rgb
   bool isInternalGrey;
   bool isInternal444;

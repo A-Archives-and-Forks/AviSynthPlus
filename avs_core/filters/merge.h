@@ -42,6 +42,14 @@
 #define __Merge_H__
 
 #include <avisynth.h>
+#include "overlay/blend_common.h"
+#ifdef INTEL_INTRINSICS
+#include "overlay/intel/blend_common_avx2.h"
+#include "overlay/intel/blend_common_sse.h"
+#endif
+#ifdef NEON_INTRINSICS
+#include "overlay/aarch64/blend_common_neon.h"
+#endif
 
 
 /****************************************************
@@ -118,18 +126,32 @@ private:
   int bits_per_pixel;
 };
 
-typedef void(*MergeFuncPtr) (BYTE *p1, const BYTE *p2, int p1_pitch, int p2_pitch, int rowsize, int height, float weight_f, int weight_i, int invweight_i);
+// Dispatch helpers for weighted (non-average) merges using the unified API.
+// Callers compute:
+//   pixelsize = bits_per_pixel <= 8 ? 1 : (bits_per_pixel == 32 ? 4 : 2)
+//   width     = rowsize / pixelsize
+//   weight_i  = (int)(weight_f * 32768.0f + 0.5f)
+//   invweight_i = 32768 - weight_i
+// Float clips use get_weighted_merge_float_fn; integer clips use get_weighted_merge_fn.
+inline weighted_merge_fn_t* get_weighted_merge_fn(int cpuFlags) {
 #ifdef INTEL_INTRINSICS
-MergeFuncPtr getMergeFunc(int bits_per_pixel, int cpuFlags, BYTE *srcp, const BYTE *otherp, float weight_f, int &weight_i, int &invweight_i);
-#else
-MergeFuncPtr getMergeFunc(int bits_per_pixel, BYTE *srcp, const BYTE *otherp, float weight_f, int &weight_i, int &invweight_i);
+  if (cpuFlags & CPUF_AVX2) return &weighted_merge_avx2;
+  if (cpuFlags & CPUF_SSE2) return &weighted_merge_sse2;
 #endif
-
-template<bool lessthan16bit>
-void weighted_merge_planar_uint16_sse2(BYTE *p1, const BYTE *p2, int p1_pitch, int p2_pitch, int rowsize, int height, float weight_f, int weight_i, int invweight_i);
-
-template<typename pixel_t>
-void weighted_merge_planar_c(BYTE *p1, const BYTE *p2, int p1_pitch, int p2_pitch, int rowsize, int height, float weight_f, int weight_i, int invweight_i);
-void weighted_merge_planar_c_float(BYTE *p1, const BYTE *p2, int p1_pitch, int p2_pitch, int rowsize, int height, float weight_f, int weight_i, int invweight_i);
+#ifdef NEON_INTRINSICS
+  if (cpuFlags & CPUF_ARM_NEON) return &weighted_merge_neon;
+#endif
+  return &weighted_merge_c;
+}
+inline weighted_merge_float_fn_t* get_weighted_merge_float_fn(int cpuFlags) {
+#ifdef INTEL_INTRINSICS
+  if (cpuFlags & CPUF_AVX2) return &weighted_merge_float_avx2;
+  if (cpuFlags & CPUF_SSE2) return &weighted_merge_float_sse2;
+#endif
+#ifdef NEON_INTRINSICS
+  if (cpuFlags & CPUF_ARM_NEON) return &weighted_merge_float_neon;
+#endif
+  return &weighted_merge_float_c;
+}
 
 #endif  // __Merge_H__

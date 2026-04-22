@@ -37,279 +37,341 @@
 #include "../blend_common.h"
 
 #include <stdint.h>
+#include <vector>
 
 #ifdef _MSC_VER
 #include <intrin.h>
 #else
 #include <x86intrin.h>
 #endif
-#include  <immintrin.h>
+#include <immintrin.h>
+
+// simd_magic_div_32_avx2 is in masked_rowprep_avx2.hpp (included by masked_merge_avx2_impl.hpp).
+// blend8_masked_avx2_row, blend16_masked_avx2_row, masked_merge_avx2_impl
+// (implementation-include, no guards — each TU gets its own compiled copy)
+#include "masked_merge_avx2_impl.hpp"
 
 
 
-
-template<bool has_mask, typename pixel_t, bool lessthan16bits>
-void overlay_blend_avx2_uint(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch,
-  const int width, const int height, const int opacity, const float opacity_f, const int bits_per_pixel)
+void masked_merge_float_avx2(BYTE* p1, const BYTE* p2, const BYTE* mask,
+  int p1_pitch, int p2_pitch, int mask_pitch,
+  int width, int height, float opacity_f)
 {
-  const auto rounder = _mm256_set1_ps(0.5f);
-  const int max_pixel_value = (1 << bits_per_pixel) - 1;
-  const auto factor = has_mask ? opacity_f / max_pixel_value : opacity_f;
-  const auto factor_v = _mm256_set1_ps(factor);
-
-  constexpr int pixels_per_cycle = 16;
-  constexpr int bytes_per_cycle = pixels_per_cycle * sizeof(pixel_t);
-  const int wMod = (width * sizeof(pixel_t) / bytes_per_cycle) * bytes_per_cycle;
-
-  // key formula: p1*(1-factor)+p2*factor -> p1 + (p2 - p1) * factor 
-  for (int y = 0; y < height; y++) {
-    for (int x = 0; x < wMod; x += bytes_per_cycle) {
-      if constexpr (lessthan16bits) {
-        // 8-14 bits: int16 delta -> float factor -> int16 delta_scaled -->
-        // int16 result = p1 + delta_scaled (all in int16 domain except factor!)
-        __m256i p1_i16, p2_i16, delta_i16;
-        __m256i mask_i16;
-
-        if constexpr (sizeof(pixel_t) == 1) {
-          // 8 bits
-          __m128i p1_u8 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p1 + x));
-          __m128i p2_u8 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p2 + x));
-
-          p1_i16 = _mm256_cvtepu8_epi16(p1_u8);
-          p2_i16 = _mm256_cvtepu8_epi16(p2_u8);
-
-          if constexpr (has_mask) {
-            __m128i mask_u8 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(mask + x));
-            mask_i16 = _mm256_cvtepu8_epi16(mask_u8);
-          }
-        }
-        else { // 10/12/14 bits
-          p1_i16 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p1 + x));
-          p2_i16 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p2 + x));
-
-          if constexpr (has_mask) {
-            mask_i16 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(mask + x));
-          }
-        }
-
-        delta_i16 = _mm256_sub_epi16(p2_i16, p1_i16);
-
-        // split for 32-bit processing
-        __m128i delta_i16_lo = _mm256_castsi256_si128(delta_i16);
-        __m128i delta_i16_hi = _mm256_extracti128_si256(delta_i16, 1);
-
-        // convert _only_ delta and mask to 32-bit
-        __m256i delta_lo_i32 = _mm256_cvtepi16_epi32(delta_i16_lo);
-        __m256i delta_hi_i32 = _mm256_cvtepi16_epi32(delta_i16_hi);
-
-        // convert _only_ delta to float
-        __m256 delta_lo_f = _mm256_cvtepi32_ps(delta_lo_i32);
-        __m256 delta_hi_f = _mm256_cvtepi32_ps(delta_hi_i32);
-
-        __m256 delta_scaled_lo, delta_scaled_hi;
-
-        if constexpr (has_mask) {
-          __m128i mask_i16_lo = _mm256_castsi256_si128(mask_i16);
-          __m128i mask_i16_hi = _mm256_extracti128_si256(mask_i16, 1);
-
-          __m256i mask_lo_i32 = _mm256_cvtepu16_epi32(mask_i16_lo);
-          __m256i mask_hi_i32 = _mm256_cvtepu16_epi32(mask_i16_hi);
-
-          __m256 mask_lo_f = _mm256_cvtepi32_ps(mask_lo_i32);
-          __m256 mask_hi_f = _mm256_cvtepi32_ps(mask_hi_i32);
-
-          __m256 new_factor_lo = _mm256_mul_ps(mask_lo_f, factor_v);
-          __m256 new_factor_hi = _mm256_mul_ps(mask_hi_f, factor_v);
-
-          // scale delta: delta * factor
-          delta_scaled_lo = _mm256_mul_ps(delta_lo_f, new_factor_lo);
-          delta_scaled_hi = _mm256_mul_ps(delta_hi_f, new_factor_hi);
-        }
-        else {
-          delta_scaled_lo = _mm256_mul_ps(delta_lo_f, factor_v);
-          delta_scaled_hi = _mm256_mul_ps(delta_hi_f, factor_v);
-        }
-
-        // round and truncate to int32
-        delta_scaled_lo = _mm256_add_ps(delta_scaled_lo, rounder);
-        delta_scaled_hi = _mm256_add_ps(delta_scaled_hi, rounder);
-        __m256i delta_scaled_i32_lo = _mm256_cvttps_epi32(delta_scaled_lo);
-        __m256i delta_scaled_i32_hi = _mm256_cvttps_epi32(delta_scaled_hi);
-
-        // scaled delta back to int16
-        __m256i delta_scaled_i16 = _mm256_packs_epi32(delta_scaled_i32_lo, delta_scaled_i32_hi);
-        delta_scaled_i16 = _mm256_permute4x64_epi64(delta_scaled_i16, 0xD8);
-
-        // +p1
-        __m256i result_i16 = _mm256_add_epi16(p1_i16, delta_scaled_i16);
-
-        if constexpr (sizeof(pixel_t) == 1) {
-          __m128i i16_lo_128 = _mm256_castsi256_si128(result_i16);
-          __m128i i16_hi_128 = _mm256_extracti128_si256(result_i16, 1);
-          __m128i result_u8 = _mm_packus_epi16(i16_lo_128, i16_hi_128);
-
-          _mm_storeu_si128(reinterpret_cast<__m128i*>(p1 + x), result_u8);
-        }
-        else {
-          _mm256_storeu_si256(reinterpret_cast<__m256i*>(p1 + x), result_i16);
-        }
-      }
-      else { // 16-bit overflow-safe, int32 and float
-        static_assert(sizeof(pixel_t) == 2, "lessthan16bits=false only for uint16_t");
-
-        // 16xuint16_t pixels
-        __m256i p1_u16 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p1 + x));
-        __m256i p2_u16 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p2 + x));
-
-        __m128i p1_u16_lo = _mm256_castsi256_si128(p1_u16);
-        __m128i p1_u16_hi = _mm256_extracti128_si256(p1_u16, 1);
-        __m128i p2_u16_lo = _mm256_castsi256_si128(p2_u16);
-        __m128i p2_u16_hi = _mm256_extracti128_si256(p2_u16, 1);
-
-        // to int32 (8 pixels per __m256i)
-        __m256i p1_i32_lo = _mm256_cvtepu16_epi32(p1_u16_lo);
-        __m256i p1_i32_hi = _mm256_cvtepu16_epi32(p1_u16_hi);
-        __m256i p2_i32_lo = _mm256_cvtepu16_epi32(p2_u16_lo);
-        __m256i p2_i32_hi = _mm256_cvtepu16_epi32(p2_u16_hi);
-
-        // p2-p1 in int32 and only then float
-        __m256i delta_lo_32 = _mm256_sub_epi32(p2_i32_lo, p1_i32_lo);
-        __m256i delta_hi_32 = _mm256_sub_epi32(p2_i32_hi, p1_i32_hi);
-        __m256 delta_f_lo = _mm256_cvtepi32_ps(delta_lo_32);
-        __m256 delta_f_hi = _mm256_cvtepi32_ps(delta_hi_32);
-
-        __m256 delta_scaled_lo, delta_scaled_hi;
-        if constexpr (has_mask) {
-          __m256i mask_u16 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(mask + x));
-          __m128i mask_u16_lo = _mm256_castsi256_si128(mask_u16);
-          __m128i mask_u16_hi = _mm256_extracti128_si256(mask_u16, 1);
-
-          __m256i mask_i32_lo = _mm256_cvtepu16_epi32(mask_u16_lo);
-          __m256i mask_i32_hi = _mm256_cvtepu16_epi32(mask_u16_hi);
-          __m256 mask_f_lo = _mm256_cvtepi32_ps(mask_i32_lo);
-          __m256 mask_f_hi = _mm256_cvtepi32_ps(mask_i32_hi);
-
-          __m256 new_factor_lo = _mm256_mul_ps(mask_f_lo, factor_v);
-          __m256 new_factor_hi = _mm256_mul_ps(mask_f_hi, factor_v);
-
-          delta_scaled_lo = _mm256_mul_ps(delta_f_lo, new_factor_lo);
-          delta_scaled_hi = _mm256_mul_ps(delta_f_hi, new_factor_hi);
-        }
-        else {
-          delta_scaled_lo = _mm256_mul_ps(delta_f_lo, factor_v);
-          delta_scaled_hi = _mm256_mul_ps(delta_f_hi, factor_v);
-        }
-
-        // round and truncate to int32
-        delta_scaled_lo = _mm256_add_ps(delta_scaled_lo, rounder);
-        delta_scaled_hi = _mm256_add_ps(delta_scaled_hi, rounder);
-        __m256i delta_scaled_i32_lo = _mm256_cvttps_epi32(delta_scaled_lo);
-        __m256i delta_scaled_i32_hi = _mm256_cvttps_epi32(delta_scaled_hi);
-
-        // p1 + delta_scaled still in int32
-        __m256i result_i32_lo = _mm256_add_epi32(p1_i32_lo, delta_scaled_i32_lo);
-        __m256i result_i32_hi = _mm256_add_epi32(p1_i32_hi, delta_scaled_i32_hi);
-
-        // 8 int32 -> 8 uint16 in lower half
-        __m256i i16_lo = _mm256_packus_epi32(result_i32_lo, result_i32_lo);
-        __m256i i16_hi = _mm256_packus_epi32(result_i32_hi, result_i32_hi);
-
-        // get correct layout
-        i16_lo = _mm256_permute4x64_epi64(i16_lo, 0xD8);
-        i16_hi = _mm256_permute4x64_epi64(i16_hi, 0xD8);
-
-        // Extract lower 128 bits from each
-        __m128i result_u16_lo = _mm256_castsi256_si128(i16_lo);
-        __m128i result_u16_hi = _mm256_castsi256_si128(i16_hi);
-
-        // Combine back into a single __m256i and store
-        __m256i result_u16 = _mm256_setr_m128i(result_u16_lo, result_u16_hi);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(p1 + x), result_u16);
-      }
-    }
-
-    // Scalar tail
-    // Working with exact dimension, overlay is possible atop an existing frame at any position
-    for (int x = wMod / sizeof(pixel_t); x < width; x++) {
-      const float new_factor = has_mask ? static_cast<float>(reinterpret_cast<const pixel_t*>(mask)[x]) * factor : factor;
-      const pixel_t pix1 = reinterpret_cast<pixel_t*>(p1)[x];
-      const pixel_t pix2 = reinterpret_cast<const pixel_t*>(p2)[x];
-      pixel_t result = pix1 + (int)((pix2 - pix1) * new_factor + 0.5f);
-      reinterpret_cast<pixel_t*>(p1)[x] = result;
-    }
-
-    p1 += p1_pitch;
-    p2 += p2_pitch;
-    if (has_mask)
-      mask += mask_pitch;
-  }
-}
-
-// instantiate
-// mask yes/no
-template void overlay_blend_avx2_uint<true, uint8_t, true>(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch, const int width, const int height, const int opacity, const float opacity_f, const int bits_per_pixel);
-template void overlay_blend_avx2_uint<true, uint16_t, true>(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch, const int width, const int height, const int opacity, const float opacity_f, const int bits_per_pixel);
-template void overlay_blend_avx2_uint<true, uint16_t, false>(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch, const int width, const int height, const int opacity, const float opacity_f, const int bits_per_pixel);
-//--
-template void overlay_blend_avx2_uint<false, uint8_t, true>(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch, const int width, const int height, const int opacity, const float opacity_f, const int bits_per_pixel);
-template void overlay_blend_avx2_uint<false, uint16_t, true>(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch, const int width, const int height, const int opacity, const float opacity_f, const int bits_per_pixel);
-template void overlay_blend_avx2_uint<false, uint16_t, false>(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch, const int width, const int height, const int opacity, const float opacity_f, const int bits_per_pixel);
-
-template<bool has_mask>
-void overlay_blend_avx2_float(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch,
-  const int width, const int height, const int opacity, const float opacity_f, const int bits_per_pixel)
-{
-
   const int realwidth = width * sizeof(float);
-
-  int wMod32 = (realwidth / 32) * 32;
-  auto opacity_v = _mm256_set1_ps(opacity_f);
+  const int wMod32 = (realwidth / 32) * 32;
+  const __m256 opacity_v = _mm256_set1_ps(opacity_f);
 
   for (int y = 0; y < height; y++) {
     for (int x = 0; x < wMod32; x += 32) {
-      auto p1_f = _mm256_loadu_ps(reinterpret_cast<const float*>(p1 + x));
-      auto p2_f = _mm256_loadu_ps(reinterpret_cast<const float*>(p2 + x));
-      __m256 new_mask;
-      if constexpr (has_mask) {
-        new_mask = _mm256_loadu_ps(reinterpret_cast<const float*>(mask + x));
-        new_mask = _mm256_mul_ps(new_mask, opacity_v);
-      }
-      else {
-        new_mask = opacity_v;
-      }
-      auto result = _mm256_add_ps(p1_f, _mm256_mul_ps(_mm256_sub_ps(p2_f, p1_f), new_mask)); // p1*(1-mask) + p2*mask = p1+(p2-p1)*mask
-
-      _mm256_storeu_ps(reinterpret_cast<float*>(p1 + x), result);
+      const __m256 p1_f   = _mm256_loadu_ps(reinterpret_cast<const float*>(p1 + x));
+      const __m256 p2_f   = _mm256_loadu_ps(reinterpret_cast<const float*>(p2 + x));
+      const __m256 mask_f = _mm256_mul_ps(_mm256_loadu_ps(reinterpret_cast<const float*>(mask + x)), opacity_v);
+      // p1*(1-m) + p2*m  =  p1 + (p2-p1)*m
+      _mm256_storeu_ps(reinterpret_cast<float*>(p1 + x),
+        _mm256_add_ps(p1_f, _mm256_mul_ps(_mm256_sub_ps(p2_f, p1_f), mask_f)));
     }
-
-    // Leftover value
-    // Working with exact dimension, overlay is possible atop an existing frame at any position
-    for (int x = wMod32 / sizeof(float); x < width; x++) {
-      auto new_mask = has_mask ? reinterpret_cast<const float*>(mask)[x] * opacity_f : opacity_f;
-      auto p1x = reinterpret_cast<float*>(p1)[x];
-      auto p2x = reinterpret_cast<const float*>(p2)[x];
-      auto result = p1x + (p2x - p1x) * new_mask; // p1x*(1-new_mask) + p2x*mask
-      reinterpret_cast<float*>(p1)[x] = result;
+    for (int x = wMod32 / (int)sizeof(float); x < width; x++) {
+      const float m  = reinterpret_cast<const float*>(mask)[x] * opacity_f;
+      const float a  = reinterpret_cast<float*>(p1)[x];
+      const float b  = reinterpret_cast<const float*>(p2)[x];
+      reinterpret_cast<float*>(p1)[x] = a + (b - a) * m;
     }
-
-
-    p1 += p1_pitch;
-    p2 += p2_pitch;
-    if constexpr (has_mask)
-      mask += mask_pitch;
+    p1   += p1_pitch;
+    p2   += p2_pitch;
+    mask += mask_pitch;
   }
 }
 
-template void overlay_blend_avx2_float<false>(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch, const int width, const int height, const int opacity, const float opacity_f, const int bits_per_pixel);
-template void overlay_blend_avx2_float<true>(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch, const int width, const int height, const int opacity, const float opacity_f, const int bits_per_pixel);
+// ---------------------------------------------------------------------------
+// Public Overlay API — fixed MASK444 (mask already at plane resolution).
+// Used for the normal (non-scratch) Overlay path where the mask is at chroma resolution.
+// ---------------------------------------------------------------------------
+
+void masked_merge_avx2(BYTE* p1, const BYTE* p2, const BYTE* mask,
+  int p1_pitch, int p2_pitch, int mask_pitch,
+  int width, int height, int opacity, int bits_per_pixel)
+{
+  masked_merge_avx2_impl<MASK444>(p1, p2, mask, p1_pitch, p2_pitch, mask_pitch,
+    width, height, opacity, bits_per_pixel);
+}
+
+// ---------------------------------------------------------------------------
+// Family 1: weighted_merge — AVX2 (no mask, flat weight, >> 15 shift)
+// weight + invweight == 32768; boundary values (0, 32768) are caller early-outs.
+// ---------------------------------------------------------------------------
+
+static void weighted_merge_uint8_avx2_impl(
+  BYTE* p1, const BYTE* p2, int p1_pitch, int p2_pitch,
+  int rowsize, int height, int weight_i, int invweight_i)
+{
+  // interleaved mask: invweight in lo word, weight in hi word → madd gives p1*inv + p2*w
+  const auto mask       = _mm256_set1_epi32(invweight_i | (weight_i << 16));
+  const auto round_mask = _mm256_set1_epi32(0x4000);
+  const auto zero       = _mm256_setzero_si256();
+
+  const auto mask_128       = _mm_set1_epi32(invweight_i | (weight_i << 16));
+  const auto round_mask_128 = _mm_set1_epi32(0x4000);
+  const auto zero_128       = _mm_setzero_si128();
+
+  const int wMod32 = (rowsize / 32) * 32;
+  const int wMod16 = (rowsize / 16) * 16;
+
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < wMod32; x += 32) {
+      auto px1  = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p1 + x));
+      auto px2  = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p2 + x));
+
+      auto p07   = _mm256_unpacklo_epi8(px1, px2);   // interleave p1/p2 bytes
+      auto p815  = _mm256_unpackhi_epi8(px1, px2);
+
+      auto p03   = _mm256_unpacklo_epi8(p07, zero);  // zero-extend to 16-bit pairs
+      auto p47   = _mm256_unpackhi_epi8(p07, zero);
+      auto p811  = _mm256_unpacklo_epi8(p815, zero);
+      auto p1215 = _mm256_unpackhi_epi8(p815, zero);
+
+      p03   = _mm256_add_epi32(_mm256_madd_epi16(p03,   mask), round_mask);
+      p47   = _mm256_add_epi32(_mm256_madd_epi16(p47,   mask), round_mask);
+      p811  = _mm256_add_epi32(_mm256_madd_epi16(p811,  mask), round_mask);
+      p1215 = _mm256_add_epi32(_mm256_madd_epi16(p1215, mask), round_mask);
+
+      p03   = _mm256_srli_epi32(p03,   15);
+      p47   = _mm256_srli_epi32(p47,   15);
+      p811  = _mm256_srli_epi32(p811,  15);
+      p1215 = _mm256_srli_epi32(p1215, 15);
+
+      p07  = _mm256_packs_epi32(p03,  p47);
+      p815 = _mm256_packs_epi32(p811, p1215);
+
+      _mm256_storeu_si256(reinterpret_cast<__m256i*>(p1 + x),
+        _mm256_packus_epi16(p07, p815));
+    }
+
+    for (int x = wMod32; x < wMod16; x += 16) {
+      auto px1  = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p1 + x));
+      auto px2  = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p2 + x));
+
+      auto p07   = _mm_unpacklo_epi8(px1, px2);
+      auto p815  = _mm_unpackhi_epi8(px1, px2);
+
+      auto p03   = _mm_unpacklo_epi8(p07, zero_128);
+      auto p47   = _mm_unpackhi_epi8(p07, zero_128);
+      auto p811  = _mm_unpacklo_epi8(p815, zero_128);
+      auto p1215 = _mm_unpackhi_epi8(p815, zero_128);
+
+      p03   = _mm_add_epi32(_mm_madd_epi16(p03,   mask_128), round_mask_128);
+      p47   = _mm_add_epi32(_mm_madd_epi16(p47,   mask_128), round_mask_128);
+      p811  = _mm_add_epi32(_mm_madd_epi16(p811,  mask_128), round_mask_128);
+      p1215 = _mm_add_epi32(_mm_madd_epi16(p1215, mask_128), round_mask_128);
+
+      p03   = _mm_srli_epi32(p03,   15);
+      p47   = _mm_srli_epi32(p47,   15);
+      p811  = _mm_srli_epi32(p811,  15);
+      p1215 = _mm_srli_epi32(p1215, 15);
+
+      p07  = _mm_packs_epi32(p03,  p47);
+      p815 = _mm_packs_epi32(p811, p1215);
+
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(p1 + x),
+        _mm_packus_epi16(p07, p815));
+    }
+
+    // Scalar tail
+    for (int x = wMod16; x < rowsize; ++x)
+      p1[x] = (uint8_t)((p1[x] * invweight_i + p2[x] * weight_i + 16384) >> 15);
+
+    p1 += p1_pitch;
+    p2 += p2_pitch;
+  }
+}
+
+// lessthan16bit=true:  10/12/14-bit — no signed pivot needed (values fit positive int16)
+// lessthan16bit=false: full 16-bit  — signed pivot to avoid unsigned overflow in madd
+template<bool lessthan16bit>
+static void weighted_merge_uint16_avx2_impl(
+  BYTE* p1, const BYTE* p2, int p1_pitch, int p2_pitch,
+  int rowsize, int height, int weight_i, int invweight_i)
+{
+  // After unpacklo_epi16(px1,px2): pairs are (px1[i], px2[i]).
+  // mask lo=invweight, hi=weight → madd gives px1*invweight + px2*weight.
+  const __m256i mask         = _mm256_set1_epi32((weight_i << 16) + invweight_i);
+  const __m256i round_mask   = _mm256_set1_epi32(0x4000);
+  const __m256i signed_shift = _mm256_set1_epi16(-32768);  // add to convert u16→s16
+
+  const __m128i mask_128         = _mm_set1_epi32((weight_i << 16) + invweight_i);
+  const __m128i round_mask_128   = _mm_set1_epi32(0x4000);
+  const __m128i signed_shift_128 = _mm_set1_epi16(-32768);
+
+  const int wMod32 = (rowsize / 32) * 32;
+  const int wMod16 = (rowsize / 16) * 16;
+
+  for (int y = 0; y < height; y++) {
+    // 32-byte (16 pixels) AVX2 loop
+    for (int x = 0; x < wMod32; x += 32) {
+      __m256i px1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p1 + x));
+      __m256i px2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p2 + x));
+
+      if constexpr (!lessthan16bit) {
+        // Shift unsigned 0..65535 → signed -32768..32767 for madd safety
+        px1 = _mm256_add_epi16(px1, signed_shift);
+        px2 = _mm256_add_epi16(px2, signed_shift);
+      }
+
+      auto p03 = _mm256_unpacklo_epi16(px1, px2);
+      auto p47 = _mm256_unpackhi_epi16(px1, px2);
+
+      p03 = _mm256_add_epi32(_mm256_madd_epi16(p03, mask), round_mask);
+      p47 = _mm256_add_epi32(_mm256_madd_epi16(p47, mask), round_mask);
+
+      p03 = _mm256_srai_epi32(p03, 15);
+      p47 = _mm256_srai_epi32(p47, 15);
+
+      auto p07 = _mm256_packs_epi32(p03, p47);
+      if constexpr (!lessthan16bit) {
+        // Restore: signed → unsigned by adding 32768 (modular: -32768 + 32768 = 0)
+        p07 = _mm256_add_epi16(p07, signed_shift);
+      }
+
+      _mm256_storeu_si256(reinterpret_cast<__m256i*>(p1 + x), p07);
+    }
+
+    // 16-byte (8 pixels) fallback
+    for (int x = wMod32; x < wMod16; x += 16) {
+      __m128i px1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p1 + x));
+      __m128i px2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p2 + x));
+
+      if constexpr (!lessthan16bit) {
+        px1 = _mm_add_epi16(px1, signed_shift_128);
+        px2 = _mm_add_epi16(px2, signed_shift_128);
+      }
+
+      auto p03 = _mm_unpacklo_epi16(px1, px2);
+      auto p47 = _mm_unpackhi_epi16(px1, px2);
+
+      p03 = _mm_add_epi32(_mm_madd_epi16(p03, mask_128), round_mask_128);
+      p47 = _mm_add_epi32(_mm_madd_epi16(p47, mask_128), round_mask_128);
+
+      p03 = _mm_srai_epi32(p03, 15);
+      p47 = _mm_srai_epi32(p47, 15);
+
+      auto p07 = _mm_packs_epi32(p03, p47);
+      if constexpr (!lessthan16bit) {
+        p07 = _mm_add_epi16(p07, signed_shift_128);
+      }
+
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(p1 + x), p07);
+    }
+
+    // Scalar tail (in pixels)
+    for (int x = wMod16 / 2; x < rowsize / 2; ++x) {
+      reinterpret_cast<uint16_t*>(p1)[x] = (uint16_t)(
+        (reinterpret_cast<uint16_t*>(p1)[x] * invweight_i +
+         reinterpret_cast<const uint16_t*>(p2)[x] * weight_i + 16384) >> 15);
+    }
+
+    p1 += p1_pitch;
+    p2 += p2_pitch;
+  }
+}
+
+void weighted_merge_avx2(BYTE* p1, const BYTE* p2, int p1_pitch, int p2_pitch,
+  int width, int height, int weight, int invweight, int bits_per_pixel)
+{
+  const int pixelsize = bits_per_pixel <= 8 ? 1 : 2;
+  const int rowsize   = width * pixelsize;
+
+  if (bits_per_pixel == 8)
+    weighted_merge_uint8_avx2_impl(p1, p2, p1_pitch, p2_pitch, rowsize, height, weight, invweight);
+  else if (bits_per_pixel == 16)
+    weighted_merge_uint16_avx2_impl<false>(p1, p2, p1_pitch, p2_pitch, rowsize, height, weight, invweight);
+  else  // 10, 12, 14-bit
+    weighted_merge_uint16_avx2_impl<true>(p1, p2, p1_pitch, p2_pitch, rowsize, height, weight, invweight);
+}
+
+void weighted_merge_float_avx2(BYTE* p1, const BYTE* p2, int p1_pitch, int p2_pitch,
+  int width, int height, float weight_f)
+{
+  const float invweight_f = 1.0f - weight_f;
+  const auto  v_weight    = _mm256_set1_ps(weight_f);
+  const int   rowsize     = width * 4;
+  const int   wMod32      = (rowsize / 32) * 32;
+
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < wMod32; x += 32) {
+      auto px1 = _mm256_loadu_ps(reinterpret_cast<const float*>(p1 + x));
+      auto px2 = _mm256_loadu_ps(reinterpret_cast<const float*>(p2 + x));
+      // p1 + (p2 - p1) * w  ==  p1*(1-w) + p2*w
+      _mm256_storeu_ps(reinterpret_cast<float*>(p1 + x),
+        _mm256_add_ps(px1, _mm256_mul_ps(_mm256_sub_ps(px2, px1), v_weight)));
+    }
+    // Scalar tail
+    for (int x = wMod32 / 4; x < width; ++x) {
+      reinterpret_cast<float*>(p1)[x] =
+        reinterpret_cast<float*>(p1)[x] * invweight_f +
+        reinterpret_cast<const float*>(p2)[x] * weight_f;
+    }
+    p1 += p1_pitch;
+    p2 += p2_pitch;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Overlay blend masked getter — returns masked_merge_avx2_impl instantiation.
+// is_chroma=false → always MASK444 (luma).
+// is_chroma=true  → placement-aware maskMode (chroma).
+// ---------------------------------------------------------------------------
+masked_merge_fn_t* get_overlay_blend_masked_fn_avx2(bool is_chroma, MaskMode maskMode)
+{
+#define DISPATCH_OVERLAY_BLEND_AVX2(MaskType) \
+  return is_chroma ? masked_merge_avx2_impl<MaskType> \
+                   : masked_merge_avx2_impl<MASK444>;
+
+  switch (maskMode) {
+  case MASK444:          DISPATCH_OVERLAY_BLEND_AVX2(MASK444)
+  case MASK420:          DISPATCH_OVERLAY_BLEND_AVX2(MASK420)
+  case MASK420_MPEG2:    DISPATCH_OVERLAY_BLEND_AVX2(MASK420_MPEG2)
+  case MASK420_TOPLEFT:  DISPATCH_OVERLAY_BLEND_AVX2(MASK420_TOPLEFT)
+  case MASK422:          DISPATCH_OVERLAY_BLEND_AVX2(MASK422)
+  case MASK422_MPEG2:    DISPATCH_OVERLAY_BLEND_AVX2(MASK422_MPEG2)
+  case MASK422_TOPLEFT:  DISPATCH_OVERLAY_BLEND_AVX2(MASK422_TOPLEFT)
+  case MASK411:          DISPATCH_OVERLAY_BLEND_AVX2(MASK411)
+  }
+#undef DISPATCH_OVERLAY_BLEND_AVX2
+  return masked_merge_avx2_impl<MASK444>; // unreachable
+}
+
+// Layer AVX2 dispatcher has moved to filters/intel/layer_avx2.cpp.
+
+// ---------------------------------------------------------------------------
+// Per-row chroma mask preparation for the scratch path in OF_blend.cpp.
+// Defined here so masked_rowprep_avx2.hpp is only included in this TU.
+// ---------------------------------------------------------------------------
+template<typename pixel_t, bool full_opacity>
+void do_fill_chroma_row_avx2(
+  std::vector<pixel_t>& buf, const pixel_t* luma_row,
+  int luma_pitch_pixels, int chroma_w, MaskMode mode,
+  int opacity_i, int half, MagicDiv magic)
+{
+  switch (mode) {
+  case MASK411:
+    prepare_effective_mask_for_row_avx2<MASK411,          pixel_t, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity_i, half, magic); break;
+  case MASK420:
+    prepare_effective_mask_for_row_avx2<MASK420,          pixel_t, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity_i, half, magic); break;
+  case MASK420_MPEG2:
+    prepare_effective_mask_for_row_avx2<MASK420_MPEG2,    pixel_t, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity_i, half, magic); break;
+  case MASK420_TOPLEFT:
+    prepare_effective_mask_for_row_avx2<MASK420_TOPLEFT,  pixel_t, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity_i, half, magic); break;
+  case MASK422:
+    prepare_effective_mask_for_row_avx2<MASK422,          pixel_t, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity_i, half, magic); break;
+  case MASK422_MPEG2:
+    prepare_effective_mask_for_row_avx2<MASK422_MPEG2,    pixel_t, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity_i, half, magic); break;
+  case MASK422_TOPLEFT:
+    prepare_effective_mask_for_row_avx2<MASK422_TOPLEFT,  pixel_t, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity_i, half, magic); break;
+  default: break;
+  }
+}
+
+template void do_fill_chroma_row_avx2<uint8_t,  true> (std::vector<uint8_t>&,  const uint8_t*,  int, int, MaskMode, int, int, MagicDiv);
+template void do_fill_chroma_row_avx2<uint8_t,  false>(std::vector<uint8_t>&,  const uint8_t*,  int, int, MaskMode, int, int, MagicDiv);
+template void do_fill_chroma_row_avx2<uint16_t, true> (std::vector<uint16_t>&, const uint16_t*, int, int, MaskMode, int, int, MagicDiv);
+template void do_fill_chroma_row_avx2<uint16_t, false>(std::vector<uint16_t>&, const uint16_t*, int, int, MaskMode, int, int, MagicDiv);
 

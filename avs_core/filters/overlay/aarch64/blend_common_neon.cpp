@@ -37,600 +37,396 @@
 #include "blend_common_neon.h"
 #include <arm_neon.h>
 #include <cstdint>
+#include <type_traits>
+#include <vector>
+
+// ============================================================
+// Helper: 64-bit magic-div for 10-16 bit integer paths.
+// N = 32 + magic.shift (compile-time constant).
+// Computes (v * mdiv) >> N using vmull_u32 (u32 x u32 -> u64).
+// ============================================================
+template<int N>
+static AVS_FORCEINLINE uint32x4_t magic_div_wide_neon(uint32x4_t v, uint32_t mdiv) {
+  const uint32x2_t mdiv2 = vdup_n_u32(mdiv);
+  uint64x2_t lo = vmull_u32(vget_low_u32(v), mdiv2);
+  uint64x2_t hi = vmull_u32(vget_high_u32(v), mdiv2);
+  lo = vshrq_n_u64(lo, N);
+  hi = vshrq_n_u64(hi, N);
+  return vcombine_u32(vmovn_u64(lo), vmovn_u64(hi));
+}
+
+// ============================================================
+// weighted_merge_neon
+// No mask.  kernel: (p1*invweight + p2*weight + 16384) >> 15
+// weight + invweight == 32768
+// ============================================================
+void weighted_merge_neon(BYTE* p1, const BYTE* p2,
+  int p1_pitch, int p2_pitch,
+  int width, int height,
+  int weight, int invweight,
+  int bits_per_pixel)
+{
+  const uint16_t w   = (uint16_t)weight;
+  const uint16_t inv = (uint16_t)invweight;
+  const uint32x4_t round32 = vdupq_n_u32(16384);
+
+  if (bits_per_pixel == 8) {
+    // 16 pixels per NEON iteration
+    const int vec_width = (width / 16) * 16;
+    for (int y = 0; y < height; y++) {
+      const uint8_t* srcp2 = reinterpret_cast<const uint8_t*>(p2);
+      uint8_t*       dstp  = reinterpret_cast<uint8_t*>(p1);
+
+      for (int x = 0; x < vec_width; x += 16) {
+        uint8x16_t v1 = vld1q_u8(dstp  + x);
+        uint8x16_t v2 = vld1q_u8(srcp2 + x);
+
+        uint16x8_t p1_lo = vmovl_u8(vget_low_u8(v1));
+        uint16x8_t p2_lo = vmovl_u8(vget_low_u8(v2));
+        uint16x8_t p1_hi = vmovl_high_u8(v1);
+        uint16x8_t p2_hi = vmovl_high_u8(v2);
+
+        // (p1*inv + 16384) + p2*w, then >> 15  — 4 pixels at a time
+        uint32x4_t r0 = vshrq_n_u32(vmlal_n_u16(vaddq_u32(vmull_n_u16(vget_low_u16(p1_lo),  inv), round32), vget_low_u16(p2_lo),  w), 15);
+        uint32x4_t r1 = vshrq_n_u32(vmlal_n_u16(vaddq_u32(vmull_n_u16(vget_high_u16(p1_lo), inv), round32), vget_high_u16(p2_lo), w), 15);
+        uint32x4_t r2 = vshrq_n_u32(vmlal_n_u16(vaddq_u32(vmull_n_u16(vget_low_u16(p1_hi),  inv), round32), vget_low_u16(p2_hi),  w), 15);
+        uint32x4_t r3 = vshrq_n_u32(vmlal_n_u16(vaddq_u32(vmull_n_u16(vget_high_u16(p1_hi), inv), round32), vget_high_u16(p2_hi), w), 15);
+
+        uint8x16_t result = vcombine_u8(
+          vmovn_u16(vcombine_u16(vmovn_u32(r0), vmovn_u32(r1))),
+          vmovn_u16(vcombine_u16(vmovn_u32(r2), vmovn_u32(r3))));
+        vst1q_u8(dstp + x, result);
+      }
+      for (int x = vec_width; x < width; x++)
+        dstp[x] = (uint8_t)(((uint32_t)dstp[x] * invweight + (uint32_t)srcp2[x] * weight + 16384) >> 15);
+
+      p1 += p1_pitch;
+      p2 += p2_pitch;
+    }
+  } else {
+    // 10-16 bit: 8 pixels per NEON iteration
+    const int vec_width = (width / 8) * 8;
+    for (int y = 0; y < height; y++) {
+      const uint16_t* srcp2 = reinterpret_cast<const uint16_t*>(p2);
+      uint16_t*       dstp  = reinterpret_cast<uint16_t*>(p1);
+
+      for (int x = 0; x < vec_width; x += 8) {
+        uint16x8_t v1 = vld1q_u16(dstp  + x);
+        uint16x8_t v2 = vld1q_u16(srcp2 + x);
+
+        uint32x4_t r0 = vshrq_n_u32(vmlal_n_u16(vaddq_u32(vmull_n_u16(vget_low_u16(v1),  inv), round32), vget_low_u16(v2),  w), 15);
+        uint32x4_t r1 = vshrq_n_u32(vmlal_n_u16(vaddq_u32(vmull_n_u16(vget_high_u16(v1), inv), round32), vget_high_u16(v2), w), 15);
+
+        vst1q_u16(dstp + x, vcombine_u16(vmovn_u32(r0), vmovn_u32(r1)));
+      }
+      for (int x = vec_width; x < width; x++)
+        dstp[x] = (uint16_t)(((uint32_t)dstp[x] * invweight + (uint32_t)srcp2[x] * weight + 16384) >> 15);
+
+      p1 += p1_pitch;
+      p2 += p2_pitch;
+    }
+  }
+}
+
+// ============================================================
+// weighted_merge_float_neon
+// No mask.  kernel: p1*(1-weight_f) + p2*weight_f
+// ============================================================
+void weighted_merge_float_neon(BYTE* p1, const BYTE* p2,
+  int p1_pitch, int p2_pitch,
+  int width, int height,
+  float weight_f)
+{
+  const float       invweight_f = 1.0f - weight_f;
+  const float32x4_t w_v   = vdupq_n_f32(weight_f);
+  const float32x4_t inv_v = vdupq_n_f32(invweight_f);
+
+  const int vec_width = (width / 4) * 4;
+  for (int y = 0; y < height; y++) {
+    const float* srcp2 = reinterpret_cast<const float*>(p2);
+    float*       dstp  = reinterpret_cast<float*>(p1);
+
+    for (int x = 0; x < vec_width; x += 4) {
+      float32x4_t v1 = vld1q_f32(dstp  + x);
+      float32x4_t v2 = vld1q_f32(srcp2 + x);
+      // p1 + (p2-p1)*w  ==  p1*inv + p2*w
+      vst1q_f32(dstp + x, vmlaq_f32(vmulq_f32(v1, inv_v), v2, w_v));
+    }
+    for (int x = vec_width; x < width; x++)
+      dstp[x] = dstp[x] * invweight_f + srcp2[x] * weight_f;
+
+    p1 += p1_pitch;
+    p2 += p2_pitch;
+  }
+}
+
+// ============================================================
+// masked_merge_neon_impl<maskMode, bits_per_pixel>
+//
+// Mirrors masked_merge_avx2_impl / masked_merge_impl_c in structure.
+//
+// MaskMode controls mask subsampling (MASK444 = plane-resolution,
+// MASK420/MASK422/etc. = luma-resolution; prepare_effective_mask_for_row
+// is called from blend_common.h to average the mask per row before blending).
+//
+// Subtract is handled upstream by pre-inverting the overlay (Layer::Create / Overlay).
+// No subtract template dimension here.
+//
+// 8-bit:   16-bit intermediate magic-div (mulhi-u16 style)
+// 10-16bit: 64-bit intermediate magic-div (vmull_u32 -> u64)
+// ============================================================
+
+template<MaskMode maskMode, int bits_per_pixel>
+static void masked_merge_neon_impl(
+  BYTE* p1, const BYTE* p2, const BYTE* mask,
+  int p1_pitch, int p2_pitch, int mask_pitch,
+  int width, int height, int opacity)
+{
+  static_assert(bits_per_pixel == 8 || bits_per_pixel == 10 ||
+                bits_per_pixel == 12 || bits_per_pixel == 14 ||
+                bits_per_pixel == 16, "unsupported bit depth");
+
+  using pixel_t = std::conditional_t<bits_per_pixel == 8, uint8_t, uint16_t>;
+  constexpr int      max_val = (1 << bits_per_pixel) - 1;
+  constexpr int      half    = max_val / 2;
+  constexpr MagicDiv magic   = get_magic_div(bits_per_pixel);
+
+  const pixel_t* maskp         = reinterpret_cast<const pixel_t*>(mask);
+  const int      mask_pitch_px = mask_pitch / (int)sizeof(pixel_t);
+
+  // Buffer for non-MASK444 modes: holds one row of averaged mask values.
+  std::vector<pixel_t> eff_mask_buf;
+  if constexpr (maskMode != MASK444)
+    eff_mask_buf.resize(width);
+
+  if constexpr (bits_per_pixel == 8) {
+    // --- 8-bit path: 16-bit intermediate magic-div ---
+    constexpr uint16_t magic16 = (uint16_t)magic.div;
+    constexpr int      mshift  = (int)(16 + magic.shift);  // 23
+
+    const uint16_t   opacity_u16 = (uint16_t)opacity;
+    const uint32x4_t half32      = vdupq_n_u32((uint32_t)half);
+    const uint32x4_t max32       = vdupq_n_u32((uint32_t)max_val);
+
+    const int vec_width = (width / 8) * 8;
+    for (int y = 0; y < height; y++) {
+      // Pre-compute effective mask row (no-op for MASK444: returns original pointer)
+      const pixel_t* eff_maskp = prepare_effective_mask_for_row<maskMode, pixel_t>(
+        maskp, mask_pitch_px, width, eff_mask_buf);
+
+      const uint8_t* eff_mask = reinterpret_cast<const uint8_t*>(eff_maskp);
+      const uint8_t* srcp2    = reinterpret_cast<const uint8_t*>(p2);
+      uint8_t*       dstp     = reinterpret_cast<uint8_t*>(p1);
+
+      for (int x = 0; x < vec_width; x += 8) {
+        uint16x8_t mask16v = vmovl_u8(vld1_u8(eff_mask + x));
+        uint16x8_t p1_16   = vmovl_u8(vld1_u8(dstp    + x));
+        uint16x8_t p2_raw  = vmovl_u8(vld1_u8(srcp2   + x));
+
+        const uint16x8_t p2_16 = p2_raw;
+
+        // Step 1: m = magic_div(mask * opacity + half)
+        // tmp1 = mask*opacity + half  (max 255*255+127 = 65152 fits in u16)
+        uint32x4_t tmp1_lo = vaddq_u32(vmull_n_u16(vget_low_u16(mask16v),  opacity_u16), half32);
+        uint32x4_t tmp1_hi = vaddq_u32(vmull_n_u16(vget_high_u16(mask16v), opacity_u16), half32);
+        uint16x4_t t1_lo   = vmovn_u32(tmp1_lo);
+        uint16x4_t t1_hi   = vmovn_u32(tmp1_hi);
+        uint32x4_t m_lo    = vshrq_n_u32(vmull_n_u16(t1_lo, magic16), mshift);
+        uint32x4_t m_hi    = vshrq_n_u32(vmull_n_u16(t1_hi, magic16), mshift);
+
+        // inv = max - m
+        uint32x4_t inv_lo = vsubq_u32(max32, m_lo);
+        uint32x4_t inv_hi = vsubq_u32(max32, m_hi);
+
+        // Widen p1, p2 to u32
+        uint32x4_t p1_lo32 = vmovl_u16(vget_low_u16(p1_16));
+        uint32x4_t p1_hi32 = vmovl_u16(vget_high_u16(p1_16));
+        uint32x4_t p2_lo32 = vmovl_u16(vget_low_u16(p2_16));
+        uint32x4_t p2_hi32 = vmovl_u16(vget_high_u16(p2_16));
+
+        // Step 2: result = magic_div(p1*inv + p2*m + half)
+        // p1*inv + p2*m ≤ max_val^2 (inv+m == max_val) → fits in u32; safe to narrow to u16
+        uint32x4_t tmp2_lo = vaddq_u32(vaddq_u32(vmulq_u32(p1_lo32, inv_lo), vmulq_u32(p2_lo32, m_lo)), half32);
+        uint32x4_t tmp2_hi = vaddq_u32(vaddq_u32(vmulq_u32(p1_hi32, inv_hi), vmulq_u32(p2_hi32, m_hi)), half32);
+        uint16x4_t t2_lo   = vmovn_u32(tmp2_lo);
+        uint16x4_t t2_hi   = vmovn_u32(tmp2_hi);
+        uint32x4_t res_lo  = vshrq_n_u32(vmull_n_u16(t2_lo, magic16), mshift);
+        uint32x4_t res_hi  = vshrq_n_u32(vmull_n_u16(t2_hi, magic16), mshift);
+
+        vst1_u8(dstp + x, vmovn_u16(vcombine_u16(vmovn_u32(res_lo), vmovn_u32(res_hi))));
+      }
+
+      // Scalar tail
+      for (int x = vec_width; x < width; x++) {
+        const uint32_t mval = eff_maskp[x];
+        const uint32_t t1   = mval * (uint32_t)opacity + (uint32_t)half;
+        const uint32_t m    = (t1 * (uint32_t)magic16) >> mshift;
+        const uint32_t inv  = (uint32_t)max_val - m;
+        const uint32_t b    = (uint32_t)srcp2[x];
+        const uint32_t t2   = (uint32_t)dstp[x] * inv + b * m + (uint32_t)half;
+        dstp[x] = (uint8_t)((t2 * (uint32_t)magic16) >> mshift);
+      }
+
+      p1   += p1_pitch;
+      p2   += p2_pitch;
+      // 4:2:0 modes: each chroma output row maps to 2 luma mask rows
+      if constexpr (maskMode == MASK420 || maskMode == MASK420_MPEG2 || maskMode == MASK420_TOPLEFT)
+        maskp += mask_pitch_px * 2;
+      else
+        maskp += mask_pitch_px;
+    }
+
+  } else {
+    // --- 10-16 bit path: 64-bit magic-div via vmull_u32 ---
+    constexpr uint32_t magic32     = magic.div;
+    constexpr int      total_shift = 32 + (int)magic.shift;
+
+    const uint32_t   opacity_u32 = (uint32_t)opacity;
+    const uint32x4_t half32_v    = vdupq_n_u32((uint32_t)half);
+    const uint32x4_t max32_v     = vdupq_n_u32((uint32_t)max_val);
+
+    const int vec_width = (width / 4) * 4;
+    for (int y = 0; y < height; y++) {
+      const pixel_t* eff_maskp = prepare_effective_mask_for_row<maskMode, pixel_t>(
+        maskp, mask_pitch_px, width, eff_mask_buf);
+
+      const uint16_t* eff_mask = reinterpret_cast<const uint16_t*>(eff_maskp);
+      const uint16_t* srcp2    = reinterpret_cast<const uint16_t*>(p2);
+      uint16_t*       dstp     = reinterpret_cast<uint16_t*>(p1);
+
+      for (int x = 0; x < vec_width; x += 4) {
+        uint32x4_t mask32v = vmovl_u16(vld1_u16(eff_mask + x));
+        uint32x4_t p1_32   = vmovl_u16(vld1_u16(dstp    + x));
+        uint32x4_t p2_raw  = vmovl_u16(vld1_u16(srcp2   + x));
+
+        const uint32x4_t p2_32 = p2_raw;
+
+        // tmp1 = mask * opacity + half  (fits in u32 for all depths ≤ 16)
+        uint32x4_t tmp1 = vaddq_u32(vmulq_n_u32(mask32v, opacity_u32), half32_v);
+
+        // m = magic_div_wide<total_shift>(tmp1)
+        uint32x4_t m   = magic_div_wide_neon<total_shift>(tmp1, magic32);
+        uint32x4_t inv = vsubq_u32(max32_v, m);
+
+        // tmp2 = p1*inv + p2*m + half  (bounded by max_val^2 + half < 2^32)
+        uint32x4_t tmp2 = vaddq_u32(
+          vaddq_u32(vmulq_u32(p1_32, inv), vmulq_u32(p2_32, m)),
+          half32_v);
+
+        uint32x4_t result = magic_div_wide_neon<total_shift>(tmp2, magic32);
+        vst1_u16(dstp + x, vmovn_u32(result));
+      }
+
+      // Scalar tail
+      for (int x = vec_width; x < width; x++) {
+        const uint32_t mval = eff_maskp[x];
+        const uint32_t t1   = mval * opacity_u32 + (uint32_t)half;
+        const uint32_t m    = (uint32_t)(((uint64_t)t1 * magic32) >> total_shift);
+        const uint32_t inv  = (uint32_t)max_val - m;
+        const uint32_t b    = (uint32_t)srcp2[x];
+        const uint32_t t2   = (uint32_t)dstp[x] * inv + b * m + (uint32_t)half;
+        dstp[x] = (uint16_t)(((uint64_t)t2 * magic32) >> total_shift);
+      }
+
+      p1   += p1_pitch;
+      p2   += p2_pitch;
+      if constexpr (maskMode == MASK420 || maskMode == MASK420_MPEG2 || maskMode == MASK420_TOPLEFT)
+        maskp += mask_pitch_px * 2;
+      else
+        maskp += mask_pitch_px;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Public dispatch — bits_per_pixel resolved at runtime.
+// Mirrors masked_merge_avx2_impl / masked_merge_dispatch_c in structure.
+// Call this from Layer with the appropriate MaskMode.
+// ---------------------------------------------------------------------------
+
+template<MaskMode maskMode>
+void masked_merge_neon_dispatch(BYTE* p1, const BYTE* p2, const BYTE* mask,
+  int p1_pitch, int p2_pitch, int mask_pitch,
+  int width, int height, int opacity, int bits_per_pixel)
+{
+  switch (bits_per_pixel) {
+  case  8: masked_merge_neon_impl<maskMode,  8>(p1, p2, mask, p1_pitch, p2_pitch, mask_pitch, width, height, opacity); break;
+  case 10: masked_merge_neon_impl<maskMode, 10>(p1, p2, mask, p1_pitch, p2_pitch, mask_pitch, width, height, opacity); break;
+  case 12: masked_merge_neon_impl<maskMode, 12>(p1, p2, mask, p1_pitch, p2_pitch, mask_pitch, width, height, opacity); break;
+  case 14: masked_merge_neon_impl<maskMode, 14>(p1, p2, mask, p1_pitch, p2_pitch, mask_pitch, width, height, opacity); break;
+  case 16: masked_merge_neon_impl<maskMode, 16>(p1, p2, mask, p1_pitch, p2_pitch, mask_pitch, width, height, opacity); break;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Public Overlay API — fixed MASK444 (mask already at plane resolution).
+// Mirrors masked_merge_avx2 / masked_merge_c calling their MASK444 impl.
+// ---------------------------------------------------------------------------
+
+void masked_merge_neon(BYTE* p1, const BYTE* p2, const BYTE* mask,
+  int p1_pitch, int p2_pitch, int mask_pitch,
+  int width, int height, int opacity, int bits_per_pixel)
+{
+  masked_merge_neon_dispatch<MASK444>(
+    p1, p2, mask, p1_pitch, p2_pitch, mask_pitch, width, height, opacity, bits_per_pixel);
+}
+
+// ---------------------------------------------------------------------------
+// Explicit instantiations of masked_merge_neon_dispatch.
+// Overlay path needs MASK444.  Layer support (future) needs the other modes.
+// ---------------------------------------------------------------------------
+
+// One instantiation per MaskMode — no is_chroma dimension (subtract removed, formula identical for luma and chroma).
+template void masked_merge_neon_dispatch<MASK444>       (BYTE*, const BYTE*, const BYTE*, int, int, int, int, int, int, int);
+template void masked_merge_neon_dispatch<MASK411>       (BYTE*, const BYTE*, const BYTE*, int, int, int, int, int, int, int);
+template void masked_merge_neon_dispatch<MASK420>       (BYTE*, const BYTE*, const BYTE*, int, int, int, int, int, int, int);
+template void masked_merge_neon_dispatch<MASK420_MPEG2> (BYTE*, const BYTE*, const BYTE*, int, int, int, int, int, int, int);
+template void masked_merge_neon_dispatch<MASK420_TOPLEFT>(BYTE*, const BYTE*, const BYTE*, int, int, int, int, int, int, int);
+template void masked_merge_neon_dispatch<MASK422>       (BYTE*, const BYTE*, const BYTE*, int, int, int, int, int, int, int);
+template void masked_merge_neon_dispatch<MASK422_MPEG2> (BYTE*, const BYTE*, const BYTE*, int, int, int, int, int, int, int);
+template void masked_merge_neon_dispatch<MASK422_TOPLEFT>(BYTE*, const BYTE*, const BYTE*, int, int, int, int, int, int, int);
+
+// ============================================================
+// masked_merge_float_neon
+// Float masked blend.  kernel: p1 + (p2-p1)*(mask*opacity)
+// ============================================================
+void masked_merge_float_neon(BYTE* p1, const BYTE* p2, const BYTE* mask,
+  int p1_pitch, int p2_pitch, int mask_pitch,
+  int width, int height, float opacity_f)
+{
+  const float32x4_t opacity_v = vdupq_n_f32(opacity_f);
+  const int vec_width = (width / 4) * 4;
+
+  for (int y = 0; y < height; y++) {
+    const float* maskp = reinterpret_cast<const float*>(mask);
+    const float* srcp2 = reinterpret_cast<const float*>(p2);
+    float*       dstp  = reinterpret_cast<float*>(p1);
+
+    for (int x = 0; x < vec_width; x += 4) {
+      float32x4_t v_mask = vmulq_f32(vld1q_f32(maskp + x), opacity_v);
+      float32x4_t v_p1   = vld1q_f32(dstp  + x);
+      float32x4_t v_p2   = vld1q_f32(srcp2 + x);
+      // p1 + (p2 - p1) * (mask * opacity)
+      vst1q_f32(dstp + x, vmlaq_f32(v_p1, vsubq_f32(v_p2, v_p1), v_mask));
+    }
+    for (int x = vec_width; x < width; x++) {
+      const float m = maskp[x] * opacity_f;
+      dstp[x] = dstp[x] + (srcp2[x] - dstp[x]) * m;
+    }
+
+    p1   += p1_pitch;
+    p2   += p2_pitch;
+    mask += mask_pitch;
+  }
+}
 
 /********************************
  ********* Blend Opaque *********
  ** Use for Lighten and Darken **
  ********************************/
 
-// avs_core/filters/overlay/aarch64/blend_common_neon.cpp
-
-template<typename pixel_t>
-static AVS_FORCEINLINE void Eightpixels_to_Eightfloats_neon(const pixel_t* src, float32x4_t& src_lo, float32x4_t& src_hi) {
-  if constexpr (sizeof(pixel_t) == 1) {
-    // Load 8 bytes, widen to 8x16, then to 8x32, then to float
-    uint8x8_t v = vld1_u8(reinterpret_cast<const uint8_t*>(src));
-    uint16x8_t v16 = vmovl_u8(v);
-    uint32x4_t v32_lo = vmovl_u16(vget_low_u16(v16));
-    uint32x4_t v32_hi = vmovl_u16(vget_high_u16(v16));
-    src_lo = vcvtq_f32_u32(v32_lo);
-    src_hi = vcvtq_f32_u32(v32_hi);
-  } else {
-    // 16-bit: load 8x16, widen to 8x32, then to float
-    uint16x8_t v16 = vld1q_u16(reinterpret_cast<const uint16_t*>(src));
-    uint32x4_t v32_lo = vmovl_u16(vget_low_u16(v16));
-    uint32x4_t v32_hi = vmovl_u16(vget_high_u16(v16));
-    src_lo = vcvtq_f32_u32(v32_lo);
-    src_hi = vcvtq_f32_u32(v32_hi);
-  }
-}
-
-template<typename pixel_t>
-static AVS_FORCEINLINE void Store_Eightpixels_neon(pixel_t* dst, float32x4_t what_lo, float32x4_t what_hi, const float32x4_t rounder) {
-  // Add rounder and convert to int32
-  what_lo = vaddq_f32(what_lo, rounder);
-  what_hi = vaddq_f32(what_hi, rounder);
-  int32x4_t si32_lo = vcvtq_s32_f32(what_lo);
-  int32x4_t si32_hi = vcvtq_s32_f32(what_hi);
-
-  if constexpr (sizeof(pixel_t) == 1) {
-    // Clamp to [0,255], narrow to 16, then to 8, and store 8 bytes
-    uint16x4_t u16_lo = vqmovun_s32(si32_lo);
-    uint16x4_t u16_hi = vqmovun_s32(si32_hi);
-    uint8x8_t u8 = vqmovn_u16(vcombine_u16(u16_lo, u16_hi));
-    vst1_u8(reinterpret_cast<uint8_t*>(dst), u8);
-  } else {
-    // Clamp to [0,65535], narrow to 16, and store 8x16
-    uint16x4_t u16_lo = vqmovun_s32(si32_lo);
-    uint16x4_t u16_hi = vqmovun_s32(si32_hi);
-    uint16x8_t u16 = vcombine_u16(u16_lo, u16_hi);
-    vst1q_u16(reinterpret_cast<uint16_t*>(dst), u16);
-  }
-}
-
-static AVS_FORCEINLINE float32x4_t overlay_blend_neon_core(const float32x4_t& p1_f, const float32x4_t& p2_f, const float32x4_t& factor) {
-  // p1 + (p2 - p1) * factor
-  return vmlaq_f32(p1_f, vsubq_f32(p2_f, p1_f), factor);
-}
-
-template<bool has_mask, typename pixel_t>
-void overlay_blend_neon_uint_slow(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch,
-  const int width, const int height, const int opacity, const float opacity_f, const int bits_per_pixel)
-{
-  const float32x4_t rounder = vdupq_n_f32(0.5f);
-  const int max_pixel_value = (1 << bits_per_pixel) - 1;
-  const float factor = has_mask ? (opacity_f / max_pixel_value) : opacity_f;
-  const float32x4_t factor_v = vdupq_n_f32(factor);
-
-  const int realwidth = width * sizeof(pixel_t);
-  constexpr int bytes_per_cycle = 8 * sizeof(pixel_t);
-  int wMod8 = (realwidth / bytes_per_cycle) * bytes_per_cycle;
-
-  for (int y = 0; y < height; y++) {
-    for (int x = 0; x < wMod8; x += bytes_per_cycle) {
-      float32x4_t unpacked_p1_lo, unpacked_p1_hi;
-      float32x4_t unpacked_p2_lo, unpacked_p2_hi;
-      Eightpixels_to_Eightfloats_neon<pixel_t>((const pixel_t*)(p1 + x), unpacked_p1_lo, unpacked_p1_hi);
-      Eightpixels_to_Eightfloats_neon<pixel_t>((const pixel_t*)(p2 + x), unpacked_p2_lo, unpacked_p2_hi);
-
-      float32x4_t result_lo, result_hi;
-      if constexpr (has_mask) {
-        float32x4_t unpacked_mask_lo, unpacked_mask_hi;
-        Eightpixels_to_Eightfloats_neon<pixel_t>((const pixel_t*)(mask + x), unpacked_mask_lo, unpacked_mask_hi);
-        unpacked_mask_lo = vmulq_f32(unpacked_mask_lo, factor_v);
-        unpacked_mask_hi = vmulq_f32(unpacked_mask_hi, factor_v);
-        result_lo = overlay_blend_neon_core(unpacked_p1_lo, unpacked_p2_lo, unpacked_mask_lo);
-        result_hi = overlay_blend_neon_core(unpacked_p1_hi, unpacked_p2_hi, unpacked_mask_hi);
-      } else {
-        result_lo = overlay_blend_neon_core(unpacked_p1_lo, unpacked_p2_lo, factor_v);
-        result_hi = overlay_blend_neon_core(unpacked_p1_hi, unpacked_p2_hi, factor_v);
-      }
-
-      Store_Eightpixels_neon<pixel_t>((pixel_t*)(p1 + x), result_lo, result_hi, rounder);
-    }
-
-    // Leftover value
-    for (int x = wMod8 / sizeof(pixel_t); x < width; x++) {
-      const float new_factor = has_mask ? static_cast<float>(reinterpret_cast<const pixel_t*>(mask)[x]) * factor : factor;
-      auto result = overlay_blend_c_core_simple(reinterpret_cast<pixel_t*>(p1)[x], reinterpret_cast<const pixel_t*>(p2)[x], new_factor);
-      reinterpret_cast<pixel_t*>(p1)[x] = (pixel_t)(result + 0.5f);
-    }
-
-    p1 += p1_pitch;
-    p2 += p2_pitch;
-    if constexpr(has_mask)
-      mask += mask_pitch;
-  }
-}
-
-// Process_SixteenPixels_neon:
-// To the greatest surprise, gcc 14 optimized the original (non-mask) C code so perfectly, that it took
-// two days of refining to achieve their speed using these hand-crafted intrinsics :)
-// Still, I leave this here, since it can work quickly in a debug build as well, and quicker than C from LLVM 19.
-
-template<bool has_mask, typename pixel_t>
-static AVS_FORCEINLINE void Process_SixteenPixels_neon(
-  BYTE* p1_ptr, const BYTE* p2_ptr, const BYTE* mask_ptr, const float32x4_t factor_v, const float32x4_t rounder, const int offset)
-{
-  // The core blending function (p1 + (p2 - p1) * factor)
-  auto overlay_blend_neon_core = [](const float32x4_t& p1_f, const float32x4_t& delta_f, const float32x4_t& factor) -> float32x4_t {
-    // 1. Calculate the blend: p1_f + (delta_f * factor) (where delta_f = p2_f - p1_f)
-    return vfmaq_f32(p1_f, delta_f, factor); // A + B * C
-    };
-
-  // --- CASE 1: 8-bit Pixels (uint8_t) ---
-  if constexpr (sizeof(pixel_t) == 1) {
-    // Pointers
-    const uint8_t* src1 = reinterpret_cast<const uint8_t*>(p1_ptr + offset);
-    const uint8_t* src2 = reinterpret_cast<const uint8_t*>(p2_ptr + offset);
-
-    // 1. Load 16 bytes (128-bit)
-    uint8x16_t q_p1 = vld1q_u8(src1);
-    uint8x16_t q_p2 = vld1q_u8(src2);
-
-    // 2. Calc Delta and Widen P1 (Keep everything in 128-bit Q regs)
-    // Use _high intrinsics to generate 'usubl2' and 'uxtl2' instructions directly
-
-    // Low 8 pixels
-    // blending is p1 + (p2-p1)*f. We want p2-p1.
-    int16x8_t delta_16_lo = vreinterpretq_s16_u16(vsubl_u8(vget_low_u8(q_p2), vget_low_u8(q_p1)));
-
-    // High 8 pixels (Direct Hardware Instruction: usubl2)
-    int16x8_t delta_16_hi = vreinterpretq_s16_u16(vsubl_high_u8(q_p2, q_p1));
-
-    // Widen P1, cast to signed
-    int16x8_t p1_16_lo = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(q_p1)));
-    int16x8_t p1_16_hi = vreinterpretq_s16_u16(vmovl_high_u8(q_p1));
-
-    float32x4_t res0, res1, res2, res3;
-
-    if constexpr(has_mask) {
-      // const float new_factor = has_mask ? static_cast<float>(reinterpret_cast<const pixel_t*>(mask)[x]) * factor : factor;
-      // trouble: factor is fixed global here, mask is individual per pixel
-      // Since mask byte is in [0,255], the original factor [0..1] was already scaled down by 255 (8 bit max_pixel_value)
-      // So we don't have to take care here of max_pixel_value again.
-      // Is it optimal to calculate the multiplied factor_v independently?
-      // each 4 pixels must converted to 32 bit (uint8 -> signed 16 -> signed 32 -> float, like p1)
-
-      // Next calculation needs to be changed accordingly, take care of minimal lo-hi loads,
-      // stay in 128-bit pipeline as long as we can, multiply factor_v's with actual mask values
-
-      const uint8_t* src_mask = reinterpret_cast<const uint8_t*>(mask_ptr + offset);
-
-      // 1. Load 16 mask bytes
-      uint8x16_t q_mask = vld1q_u8(src_mask);
-
-      // 2. Widen 8-bit mask to 16-bit (low/high 8 pixels)
-      // and cast to signed to spare instructions on 32 bit widening
-      int16x8_t mask_16_lo = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(q_mask)));
-      int16x8_t mask_16_hi = vreinterpretq_s16_u16(vmovl_high_u8(q_mask));
-
-      // 3. Widen 16-bit mask to 32-bit (4 blocks of 4 pixels) and convert to float
-      // Stay in Signed domain, uint8_t fits into int16_t without issues
-      // Block 0 (Pixels 0-3) - new_factor0 = (float)mask[0-3] * factor_v
-      float32x4_t new_factor0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(mask_16_lo)));
-
-      // Block 1 (Pixels 4-7)
-      float32x4_t new_factor1 = vcvtq_f32_s32(vmovl_high_s16(mask_16_lo));
-
-      // Block 2 (Pixels 8-11)
-      float32x4_t new_factor2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(mask_16_hi)));
-
-      // Block 3 (Pixels 12-15)
-      float32x4_t new_factor3 = vcvtq_f32_s32(vmovl_high_s16(mask_16_hi));
-
-      // 4. Multiply mask float vectors by the constant global factor_v
-      new_factor0 = vmulq_f32(new_factor0, factor_v);
-      new_factor1 = vmulq_f32(new_factor1, factor_v);
-      new_factor2 = vmulq_f32(new_factor2, factor_v);
-      new_factor3 = vmulq_f32(new_factor3, factor_v);
-
-      // 5. Blend using the new per-pixel factors
-      // Block 0 (Pixels 0-3)
-      res0 = overlay_blend_neon_core(
-        vcvtq_f32_s32(vmovl_s16(vget_low_s16(p1_16_lo))),
-        vcvtq_f32_s32(vmovl_s16(vget_low_s16(delta_16_lo))),
-        new_factor0); // *** Use new_factor0 ***
-
-      // Block 1 (Pixels 4-7)
-      res1 = overlay_blend_neon_core(
-        vcvtq_f32_s32(vmovl_high_s16(p1_16_lo)),
-        vcvtq_f32_s32(vmovl_high_s16(delta_16_lo)),
-        new_factor1); // *** Use new_factor1 ***
-
-      // Block 2 (Pixels 8-11)
-      res2 = overlay_blend_neon_core(
-        vcvtq_f32_s32(vmovl_s16(vget_low_s16(p1_16_hi))),
-        vcvtq_f32_s32(vmovl_s16(vget_low_s16(delta_16_hi))),
-        new_factor2); // *** Use new_factor2 ***
-
-      // Block 3 (Pixels 12-15)
-      res3 = overlay_blend_neon_core(
-        vcvtq_f32_s32(vmovl_high_s16(p1_16_hi)),
-        vcvtq_f32_s32(vmovl_high_s16(delta_16_hi)),
-        new_factor3); // *** Use new_factor3 ***
-
-    }
-    else {
-      // Keep highly optimized non-mask path
-
-      // 3. Convert to Float and Blend (4 blocks of 4 pixels)
-      // We treat the 16-bit vectors as 32-bit vectors during conversion to save moves
-
-      // Block 0 (Pixels 0-3)
-      res0 = overlay_blend_neon_core(
-        vcvtq_f32_s32(vmovl_s16(vget_low_s16(p1_16_lo))),
-        vcvtq_f32_s32(vmovl_s16(vget_low_s16(delta_16_lo))),
-        factor_v);
-
-      // Block 1 (Pixels 4-7) - use _high to avoid 'dup'
-      res1 = overlay_blend_neon_core(
-        vcvtq_f32_s32(vmovl_high_s16(p1_16_lo)),
-        vcvtq_f32_s32(vmovl_high_s16(delta_16_lo)),
-        factor_v);
-
-      // Block 2 (Pixels 8-11)
-      res2 = overlay_blend_neon_core(
-        vcvtq_f32_s32(vmovl_s16(vget_low_s16(p1_16_hi))),
-        vcvtq_f32_s32(vmovl_s16(vget_low_s16(delta_16_hi))),
-        factor_v);
-
-      // Block 3 (Pixels 12-15) - use _high
-      res3 = overlay_blend_neon_core(
-        vcvtq_f32_s32(vmovl_high_s16(p1_16_hi)),
-        vcvtq_f32_s32(vmovl_high_s16(delta_16_hi)),
-        factor_v);
-    }
-
-    // 4. Rounding
-    res0 = vaddq_f32(res0, rounder);
-    res1 = vaddq_f32(res1, rounder);
-    res2 = vaddq_f32(res2, rounder);
-    res3 = vaddq_f32(res3, rounder);
-
-    // 5. Convert to Int32
-    int32x4_t s32_0 = vcvtq_s32_f32(res0);
-    int32x4_t s32_1 = vcvtq_s32_f32(res1);
-    int32x4_t s32_2 = vcvtq_s32_f32(res2);
-    int32x4_t s32_3 = vcvtq_s32_f32(res3);
-
-    // 6. FAST NARROWING (The "Compiler Trick")
-    // Instead of vmovn (which goes 128->64 bit), we use vuzp1q (Unzip).
-    // This packs the low 16-bits of every 32-bit element from two vectors into one 128-bit vector.
-    // It stays in the 128-bit pipeline.
-
-    // Narrow 32-bit -> 16-bit
-    // Takes Pixels 0-3 (s32_0) and Pixels 4-7 (s32_1) -> Pixels 0-7 (u16_lo)
-    int16x8_t u16_lo = vuzp1q_s16(vreinterpretq_s16_s32(s32_0), vreinterpretq_s16_s32(s32_1));
-
-    // Takes Pixels 8-11 (s32_2) and Pixels 12-15 (s32_3) -> Pixels 8-15 (u16_hi)
-    int16x8_t u16_hi = vuzp1q_s16(vreinterpretq_s16_s32(s32_2), vreinterpretq_s16_s32(s32_3));
-
-    // Narrow 16-bit -> 8-bit
-    // Takes Pixels 0-7 (u16_lo) and Pixels 8-15 (u16_hi) -> Pixels 0-15 (result)
-    // Note: We cast to s8 to perform the unzip on bytes
-    uint8x16_t result = vreinterpretq_u8_s8(
-      vuzp1q_s8(vreinterpretq_s8_s16(u16_lo), vreinterpretq_s8_s16(u16_hi))
-    );
-
-    // 7. Store
-    vst1q_u8(reinterpret_cast<uint8_t*>(p1_ptr + offset), result);
-  }
-  // --- CASE 2: 16-bit Pixels (uint16_t) ---
-  else if constexpr (sizeof(pixel_t) == 2) {
-    const uint16_t* src1 = reinterpret_cast<const uint16_t*>(p1_ptr + offset);
-    const uint16_t* src2 = reinterpret_cast<const uint16_t*>(p2_ptr + offset);
-
-    // 1. Bulk load + delta (like 8-bit success)
-    uint16x8_t v_p1 = vld1q_u16(src1);
-    uint16x8_t v_p2 = vld1q_u16(src2);
-
-    // 2. Bulk signed deltas (p2-p1) - vsubl_u16 → sxtl
-    int32x4_t delta_lo = vreinterpretq_s32_u32(vsubl_u16(vget_low_u16(v_p2), vget_low_u16(v_p1)));
-    int32x4_t delta_hi = vreinterpretq_s32_u32(vsubl_high_u16(v_p2, v_p1));  // Direct USUBL2
-
-    // 3. because we can have full 16 bit, we use unsigned 16 bit before 32 bit widening
-    int32x4_t p1_s_lo = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(v_p1)));
-    int32x4_t p1_s_hi = vreinterpretq_s32_u32(vmovl_high_u16(v_p1));
-
-    // 4. Single scvtf path (matches 8-bit victory)
-    float32x4_t p1_f_lo = vcvtq_f32_s32(p1_s_lo);
-    float32x4_t delta_f_lo = vcvtq_f32_s32(delta_lo);
-    float32x4_t p1_f_hi = vcvtq_f32_s32(p1_s_hi);
-    float32x4_t delta_f_hi = vcvtq_f32_s32(delta_hi);
-
-    float32x4_t res_lo, res_hi;
-
-    if constexpr (has_mask) {
-      const uint16_t* src_mask = reinterpret_cast<const uint16_t*>(mask_ptr + offset);
-      // const float new_factor = has_mask ? static_cast<float>(reinterpret_cast<const pixel_t*>(mask)[x]) * factor : factor;
-      // trouble: factor is fixed global here, mask is individual per pixel
-      // Since mask byte is in [0,(max_pixel_value-1)], the original factor [0..1] was already scaled down by (2^N - 1) 1023,4095,16383,65535 (10-16 bit max_pixel_value)
-      // So we don't have to take care here of max_pixel_value again.
-      // Is it optimal to calculate the multiplied factor_v independently?
-      // each 4 pixels must converted to 32 bit (uint16 -> signed 32 -> float, like p1)
-
-      // Next calculation needs to be changed accordingly, take care of minimal lo-hi loads,
-      // stay in 128-bit pipeline as long as we can, multiply factor_v's with actual mask values
-
-      // 1. Load 16 mask bytes
-      uint16x8_t v_mask = vld1q_u16(src_mask);
-
-      // 2. because we can have full 16 bit, we use unsigned 16 bit before 32 bit widening
-      int32x4_t mask_16_lo = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(v_mask))); // LSL, SXT
-      int32x4_t mask_16_hi = vreinterpretq_s32_u32(vmovl_high_u16(v_mask));
-
-      // 3. Widen 16-bit mask to 32-bit (4 blocks of 4 pixels) and convert to float
-      // Unlike at 8 bit, we cannot stay in Signed domain
-
-      // 4. Convert 32-bit mask to float
-      float32x4_t mask_f_lo = vcvtq_f32_s32(mask_16_lo);
-      float32x4_t mask_f_hi = vcvtq_f32_s32(mask_16_hi);
-
-      // 4. Multiply mask float vectors by the constant global factor_v
-      float32x4_t new_factor_lo = vmulq_f32(mask_f_lo, factor_v);
-      float32x4_t new_factor_hi = vmulq_f32(mask_f_hi, factor_v);
-
-      // 5. FMA + round
-      // 5. FMA using the new per-pixel factors
-      res_lo = vfmaq_f32(p1_f_lo, delta_f_lo, new_factor_lo); // *** Use new_factor_lo ***
-      res_hi = vfmaq_f32(p1_f_hi, delta_f_hi, new_factor_hi); // *** Use new_factor_hi ***
-
-    }
-    else {
-      // Keep highly optimized non-mask path
-
-    // 5. FMA + round
-      res_lo = vfmaq_f32(p1_f_lo, delta_f_lo, factor_v);
-      res_hi = vfmaq_f32(p1_f_hi, delta_f_hi, factor_v);
-    }
-
-    // Rounding +0.5f
-    res_lo = vaddq_f32(res_lo, rounder);
-    res_hi = vaddq_f32(res_hi, rounder);
-
-    // 6. FAST NON-SAT NARROW (like 8-bit uzp1 magic)
-    // With factor in [0,1], and p1,p2 in [0,65535], rounder 0.5f, the truncated result is also in [0,65535].
-    int32x4_t i32_lo = vcvtq_s32_f32(res_lo);
-    int32x4_t i32_hi = vcvtq_s32_f32(res_hi);
-
-    // Direct narrow (no vqmovun overhead)
-    int16x4_t h16_lo = vmovn_s32(i32_lo);      // MOVN, 1 cycle
-    int16x4_t h16_hi = vmovn_s32(i32_hi);
-    uint16x8_t result = vreinterpretq_u16_s16(vcombine_s16(h16_lo, h16_hi));
-
-    vst1q_u16(reinterpret_cast<uint16_t*>(p1_ptr + offset), result);
-
-  }
-}
-
-/*
-* Final new result asm:
-* _Z23overlay_blend_neon_uintILb0EhEvPhPKhS2_iiiiiifi
-  ldr	q7, [x0, x19]	//, MEM <__Uint8x16_t> [(unsigned char * {ref-all})p1_188 + ivtmp.288_938 * 1]
-  ldr	q19, [x1, x19]	//, MEM <__Uint8x16_t> [(unsigned char * {ref-all})p2_928 + ivtmp.288_938 * 1]
-  zip1	v16.16b, v7.16b, v31.16b	//,,
-  usubl	v1.8h, v19.8b, v7.8b	//,,
-  usubl2	v19.8h, v19.16b, v7.16b	//,,
-  zip2	v7.16b, v7.16b, v31.16b	//,,
-  sxtl	v18.4s, v16.4h	//,
-  sxtl	v23.4s, v1.4h	//,
-  sxtl	v20.4s, v19.4h	//,
-  sxtl	v17.4s, v7.4h	//,
-  sxtl2	v16.4s, v16.8h	//,
-  sxtl2	v1.4s, v1.8h	//,
-  sxtl2	v7.4s, v7.8h	//,
-  sxtl2	v19.4s, v19.8h	//,
-  scvtf	v18.4s, v18.4s	//,
-  scvtf	v16.4s, v16.4s	//,
-  scvtf	v23.4s, v23.4s	//,
-  scvtf	v1.4s, v1.4s	//,
-  scvtf	v17.4s, v17.4s	//,
-  scvtf	v7.4s, v7.4s	//,
-  scvtf	v20.4s, v20.4s	//,
-  scvtf	v19.4s, v19.4s	//,
-  fmla	v18.4s, v23.4s, v30.4s	//,,
-  fmla	v16.4s, v1.4s, v30.4s	//,,
-  fmla	v17.4s, v20.4s, v30.4s	//,,
-  fmla	v7.4s, v19.4s, v30.4s	//,,
-  fadd	v18.4s, v18.4s, v29.4s	//,,
-  fadd	v16.4s, v16.4s, v29.4s	//,,
-  fadd	v17.4s, v17.4s, v29.4s	//,,
-  fadd	v7.4s, v7.4s, v29.4s	//,,
-  fcvtzs	v18.4s, v18.4s	//,
-  fcvtzs	v16.4s, v16.4s	//,
-  fcvtzs	v17.4s, v17.4s	//,
-  fcvtzs	v7.4s, v7.4s	//,
-  uzp1	v16.8h, v18.8h, v16.8h	//,,
-  uzp1	v7.8h, v17.8h, v7.8h	//,,
-  uzp1	v7.16b, v16.16b, v7.16b	//,,
-  str	q7, [x0, x19]	//, MEM <__Uint8x16_t> [(unsigned char * {ref-all})p1_188 + ivtmp.288_938 * 1]
-pre SIMD:
-  ldr	q3, [x0, x19]	//, MEM <__Uint8x16_t> [(unsigned char * {ref-all})p1_194 + ivtmp.289_958 * 1]
-  ldr	q26, [x1, x19]	//, MEM <__Uint8x16_t> [(unsigned char * {ref-all})p2_948 + ivtmp.289_958 * 1]
-  dup	d27, v3.d[1]	//,
-  zip1	v18.16b, v3.16b, v31.16b	//,,
-  dup	d1, v26.d[1]	//,
-  usubl	v26.8h, v26.8b, v3.8b	//,,
-  zip1	v17.16b, v27.16b, v31.16b	//,,
-  zip1	v23.8h, v18.8h, v31.8h	//,,
-  usubl	v1.8h, v1.8b, v27.8b	//,,
-  sxtl	v22.4s, v26.4h	//,
-  zip1	v19.8h, v17.8h, v31.8h	//,,
-  zip2	v18.8h, v18.8h, v31.8h	//,,
-  sxtl	v2.4s, v1.4h	//,
-  zip2	v17.8h, v17.8h, v31.8h	//,,
-  sxtl2	v26.4s, v26.8h	//,
-  sxtl2	v1.4s, v1.8h	//,
-  ucvtf	v19.4s, v19.4s	//,
-  ucvtf	v17.4s, v17.4s	//,
-  scvtf	v2.4s, v2.4s	//,
-  scvtf	v1.4s, v1.4s	//,
-  ucvtf	v23.4s, v23.4s	//,
-  ucvtf	v18.4s, v18.4s	//,
-  scvtf	v22.4s, v22.4s	//,
-  scvtf	v26.4s, v26.4s	//,
-  fmla	v19.4s, v2.4s, v30.4s	//,,
-  fmla	v17.4s, v1.4s, v30.4s	//,,
-  fmla	v23.4s, v22.4s, v30.4s	//,,
-  fmla	v18.4s, v26.4s, v30.4s	//,,
-  fadd	v19.4s, v19.4s, v29.4s	//,,
-  fadd	v17.4s, v17.4s, v29.4s	//,,
-  fadd	v23.4s, v23.4s, v29.4s	//,,
-  fadd	v18.4s, v18.4s, v29.4s	//,,
-  fcvtzs	v19.4s, v19.4s	//,
-  fcvtzs	v17.4s, v17.4s	//,
-  fcvtzs	v23.4s, v23.4s	//,
-  fcvtzs	v18.4s, v18.4s	//,
-  uzp1	v17.8h, v19.8h, v17.8h	//,,
-  uzp1	v18.8h, v23.8h, v18.8h	//,,
-  uzp1	v17.16b, v18.16b, v17.16b	//,,
-  str	q17, [x0, x19]	//, MEM <__Uint8x16_t> [(unsigned char * {ref-all})p1_194 + ivtmp.289_958 * 1]
-
-PrevSIMD:
-  ldr	q27, [x0, x19]	//, MEM <__Uint8x16_t> [(unsigned char * {ref-all})p1_182 + ivtmp.289_958 * 1]
-  ldr	q1, [x1, x19]	//, MEM <__Uint8x16_t> [(unsigned char * {ref-all})p2_948 + ivtmp.289_958 * 1]
-  zip1	v18.16b, v27.16b, v31.16b	//,,
-  usubl	v24.8h, v1.8b, v27.8b	//,,
-  dup	d27, v27.d[1]	//,
-  dup	d1, v1.d[1]	//,
-  zip1	v25.8h, v18.8h, v31.8h	//,,
-  sxtl	v23.4s, v24.4h	//,
-  zip1	v17.16b, v27.16b, v31.16b	//,,
-  usubl	v1.8h, v1.8b, v27.8b	//,,
-  sxtl2	v24.4s, v24.8h	//,
-  zip2	v18.8h, v18.8h, v31.8h	//,,
-  zip1	v19.8h, v17.8h, v31.8h	//,,
-  sxtl	v2.4s, v1.4h	//,
-  zip2	v17.8h, v17.8h, v31.8h	//,,
-  sxtl2	v1.4s, v1.8h	//,
-  ucvtf	v25.4s, v25.4s	//,
-  scvtf	v2.4s, v2.4s	//,
-  ucvtf	v19.4s, v19.4s	//,
-  scvtf	v1.4s, v1.4s	//,
-  ucvtf	v17.4s, v17.4s	//,
-  ucvtf	v18.4s, v18.4s	//,
-  scvtf	v23.4s, v23.4s	//,
-  scvtf	v24.4s, v24.4s	//,
-  fmla	v19.4s, v2.4s, v30.4s	//,,
-  fmla	v17.4s, v1.4s, v30.4s	//,,
-  fmla	v25.4s, v23.4s, v30.4s	//,,
-  fmla	v18.4s, v24.4s, v30.4s	//,,
-  fadd	v19.4s, v19.4s, v29.4s	//,,
-  fadd	v17.4s, v17.4s, v29.4s	//,,
-  fadd	v25.4s, v25.4s, v29.4s	//,,
-  fadd	v18.4s, v18.4s, v29.4s	//,,
-  fcvtzs	v19.4s, v19.4s	//,
-  fcvtzs	v17.4s, v17.4s	//,
-  fcvtzs	v25.4s, v25.4s	//,
-  fcvtzs	v18.4s, v18.4s	//,
-  uzp1	v17.8h, v19.8h, v17.8h	//,,
-  uzp1	v18.8h, v25.8h, v18.8h	//,,
-  uzp1	v17.16b, v18.16b, v17.16b	//,,
-  str	q17, [x0, x19]	//, MEM <__Uint8x16_t> [(unsigned char * {ref-all})p1_182 + ivtmp.289_958 * 1]
-
- And the quicker C version:
-
-    ldr    q4, [x0, x16]    //, MEM <vector(16) unsigned char> [(BYTE *)p1_218 + ivtmp.60_46 * 1]
-    ldr    q25, [x1, x16]    //, MEM <const vector(16) unsigned char> [(const BYTE *)p2_62 + ivtmp.60_46 * 1]
-    zip1    v2.16b, v4.16b, v31.16b    //,,
-    zip2    v26.16b, v4.16b, v31.16b    //,,
-    usubl    v22.8h, v25.8b, v4.8b    //,,
-    usubl2    v25.8h, v25.16b, v4.16b    //,,
-    zip1    v3.8h, v2.8h, v31.8h    //,,
-    zip1    v1.8h, v26.8h, v31.8h    //,,
-    sxtl2    v21.4s, v22.8h    //,
-    sxtl    v28.4s, v25.4h    //,
-    zip2    v2.8h, v2.8h, v31.8h    //,,
-    sxtl    v22.4s, v22.4h    //,
-    zip2    v26.8h, v26.8h, v31.8h    //,,
-    sxtl2    v25.4s, v25.8h    //,
-    scvtf    v21.4s, v21.4s    //,
-    scvtf    v22.4s, v22.4s    //,
-    scvtf    v3.4s, v3.4s    //,
-    scvtf    v2.4s, v2.4s    //,
-    scvtf    v1.4s, v1.4s    //,
-    scvtf    v26.4s, v26.4s    //,
-    scvtf    v28.4s, v28.4s    //,
-    scvtf    v25.4s, v25.4s    //,
-    fmla    v3.4s, v22.4s, v30.4s    //,,
-    fmla    v2.4s, v21.4s, v30.4s    //,,
-    fmla    v1.4s, v28.4s, v30.4s    //,,
-    fmla    v26.4s, v25.4s, v30.4s    //,,
-    fadd    v3.4s, v3.4s, v29.4s    //,,
-    fadd    v2.4s, v2.4s, v29.4s    //,,
-    fadd    v1.4s, v1.4s, v29.4s    //,,
-    fadd    v26.4s, v26.4s, v29.4s    //,,
-    fcvtzs    v3.4s, v3.4s    //,
-    fcvtzs    v2.4s, v2.4s    //,
-    fcvtzs    v1.4s, v1.4s    //,
-    fcvtzs    v26.4s, v26.4s    //,
-    uzp1    v2.8h, v3.8h, v2.8h    //,,
-    uzp1    v26.8h, v1.8h, v26.8h    //,,
-    uzp1    v26.16b, v2.16b, v26.16b    //,,
-    str    q26, [x0, x16]    //, MEM <vector(16) unsigned char> [(BYTE *)p1_218 + ivtmp.60_46 * 1]
-
-
-*/
-
-
-template<bool has_mask, typename pixel_t>
-void overlay_blend_neon_uint(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch,
-  const int width, const int height, const int opacity, const float opacity_f, const int bits_per_pixel)
-{
-  const float32x4_t rounder = vdupq_n_f32(0.5f);
-  const int max_pixel_value = (1 << bits_per_pixel) - 1;
-  const float factor = has_mask ? (opacity_f / max_pixel_value) : opacity_f;
-  const float32x4_t factor_v = vdupq_n_f32(factor);
-
-  // Calculate the vectorized limit (width rounded down to the nearest multiple of 16 bytes)
-  constexpr int bytes_per_pixel = sizeof(pixel_t);
-  constexpr int pixels_per_cycle = (bytes_per_pixel == 1) ? 16 : 8; // 16 bytes per cycle
-  const int real_width_bytes = width * bytes_per_pixel;
-  const int vector_limit_bytes = (real_width_bytes / (pixels_per_cycle * bytes_per_pixel)) * (pixels_per_cycle * bytes_per_pixel);
-
-  // The vector processing size is always 16 bytes for either 8-bit (16 pixels) or 16-bit (8 pixels).
-  constexpr int bytes_per_cycle = 16;
-
-  for (int y = 0; y < height; y++) {
-    // --- Vector Loop (16 bytes at a time) ---
-    for (int x_bytes = 0; x_bytes < vector_limit_bytes; x_bytes += bytes_per_cycle) {
-      // Call the core 16-byte processing function
-      Process_SixteenPixels_neon<has_mask, pixel_t>(p1, p2, mask, factor_v, rounder, x_bytes);
-    }
-
-    // --- Scalar Tail (Pixel by pixel) ---
-    const int start_pixel = vector_limit_bytes / bytes_per_pixel;
-    for (int x = start_pixel; x < width; x++) {
-      const float new_factor = has_mask ? static_cast<float>(reinterpret_cast<const pixel_t*>(mask)[x]) * factor : factor;
-      auto result = overlay_blend_c_core_simple(reinterpret_cast<pixel_t*>(p1)[x], reinterpret_cast<const pixel_t*>(p2)[x], new_factor);
-      reinterpret_cast<pixel_t*>(p1)[x] = (pixel_t)(result + 0.5f);
-    }
-
-    p1 += p1_pitch;
-    p2 += p2_pitch;
-    if constexpr (has_mask)
-      mask += mask_pitch;
-  }
-}
-
-// instantiate
-template void overlay_blend_neon_uint<true, uint8_t>(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch, const int width, const int height, const int opacity, const float opacity_f, const int bits_per_pixel);
-template void overlay_blend_neon_uint<true, uint16_t>(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch, const int width, const int height, const int opacity, const float opacity_f, const int bits_per_pixel);
-template void overlay_blend_neon_uint<false, uint8_t>(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch, const int width, const int height, const int opacity, const float opacity_f, const int bits_per_pixel);
-template void overlay_blend_neon_uint<false, uint16_t>(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch, const int width, const int height, const int opacity, const float opacity_f, const int bits_per_pixel);
-
 // NEON equivalent of overlay_blend_opaque_sse2_core
 AVS_FORCEINLINE uint8x16_t overlay_blend_opaque_neon_core(const uint8x16_t& p1, const uint8x16_t& p2, const uint8x16_t& mask) {
-  // return (mask) ? p2 : p1;
-  // mask: 0x00 = p1, 0xFF = p2 (same as SSE)
-  // vbslq_u8(mask, p2, p1): for each bit, if mask=1, take from p2, else from p1
   return vbslq_u8(mask, p2, p1);
 }
 
@@ -641,23 +437,15 @@ AVS_FORCEINLINE uint16x8_t overlay_blend_opaque_neon_core_u16(const uint16x8_t& 
 
 // Compare functions for lighten and darken mode (8-bit)
 AVS_FORCEINLINE static uint8x16_t overlay_darken_neon_cmp(const uint8x16_t& p1, const uint8x16_t& p2) {
-  // mask = (p2 <= p1) ? 0xFF : 0x00
-  return vorrq_u8(vcltq_u8(p2, p1), vceqq_u8(p2, p1)); // (p2 < p1) | (p2 == p1)
+  return vorrq_u8(vcltq_u8(p2, p1), vceqq_u8(p2, p1));
 }
 
 AVS_FORCEINLINE static uint8x16_t overlay_lighten_neon_cmp(const uint8x16_t& p1, const uint8x16_t& p2) {
-  // mask = (p2 >= p1) ? 0xFF : 0x00
-  return vorrq_u8(vcgtq_u8(p2, p1), vceqq_u8(p2, p1)); // (p2 > p1) | (p2 == p1)
+  return vorrq_u8(vcgtq_u8(p2, p1), vceqq_u8(p2, p1));
 }
 
-// Compare functions for lighten and darken mode
-AVS_FORCEINLINE static int overlay_darken_c_cmp(BYTE p1, BYTE p2) {
-  return p2 <= p1;
-}
-
-AVS_FORCEINLINE static int overlay_lighten_c_cmp(BYTE p1, BYTE p2) {
-  return p2 >= p1;
-}
+AVS_FORCEINLINE static int overlay_darken_c_cmp(BYTE p1, BYTE p2) { return p2 <= p1; }
+AVS_FORCEINLINE static int overlay_lighten_c_cmp(BYTE p1, BYTE p2) { return p2 >= p1; }
 
 /***************************************
  ********* Mode: Lighten/Darken ********
@@ -666,7 +454,6 @@ AVS_FORCEINLINE static int overlay_lighten_c_cmp(BYTE p1, BYTE p2) {
 using OverlayNeonCompare = uint8x16_t(const uint8x16_t& p1, const uint8x16_t& p2);
 using OverlayCCompare = int(BYTE, BYTE);
 
-// Main NEON version for 8-bit
 template <OverlayNeonCompare compare, OverlayCCompare compare_c>
 void overlay_darklighten_neon(BYTE *p1Y, BYTE *p1U, BYTE *p1V, const BYTE *p2Y, const BYTE *p2U, const BYTE *p2V,
                               int p1_pitch, int p2_pitch, int width, int height) {
@@ -676,20 +463,16 @@ void overlay_darklighten_neon(BYTE *p1Y, BYTE *p1U, BYTE *p1V, const BYTE *p2Y, 
       uint8x16_t p1_y = vld1q_u8(p1Y + x);
       uint8x16_t p2_y = vld1q_u8(p2Y + x);
       uint8x16_t mask = compare(p1_y, p2_y);
-      uint8x16_t result_y = overlay_blend_opaque_neon_core(p1_y, p2_y, mask);
-      vst1q_u8(p1Y + x, result_y);
+      vst1q_u8(p1Y + x, overlay_blend_opaque_neon_core(p1_y, p2_y, mask));
 
       uint8x16_t p1_u = vld1q_u8(p1U + x);
       uint8x16_t p2_u = vld1q_u8(p2U + x);
-      uint8x16_t result_u = overlay_blend_opaque_neon_core(p1_u, p2_u, mask);
-      vst1q_u8(p1U + x, result_u);
+      vst1q_u8(p1U + x, overlay_blend_opaque_neon_core(p1_u, p2_u, mask));
 
       uint8x16_t p1_v = vld1q_u8(p1V + x);
       uint8x16_t p2_v = vld1q_u8(p2V + x);
-      uint8x16_t result_v = overlay_blend_opaque_neon_core(p1_v, p2_v, mask);
-      vst1q_u8(p1V + x, result_v);
+      vst1q_u8(p1V + x, overlay_blend_opaque_neon_core(p1_v, p2_v, mask));
     }
-    // Leftover value (fallback to C)
     for (int x = wMod16; x < width; x++) {
       int mask = compare_c(p1Y[x], p2Y[x]) ? 0xFF : 0x00;
       p1Y[x] = overlay_blend_opaque_c_core<uint8_t>(p1Y[x], p2Y[x], mask);
@@ -701,82 +484,34 @@ void overlay_darklighten_neon(BYTE *p1Y, BYTE *p1U, BYTE *p1V, const BYTE *p2Y, 
   }
 }
 
-
-template<bool has_mask>
-void overlay_blend_neon_float(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch,
-  const int width, const int height, const int /*opacity*/, const float opacity_f, const int bits_per_pixel)
-{
-  const int realwidth = width * sizeof(float);
-  int wMod16 = (realwidth / 16) * 16;
-  float32x4_t opacity_v = vdupq_n_f32(opacity_f);
-
-  for (int y = 0; y < height; y++) {
-    for (int x = 0; x < wMod16; x += 16) {
-      float32x4_t p1_f0 = vld1q_f32(reinterpret_cast<const float*>(p1 + x + 0));
-      float32x4_t p1_f1 = vld1q_f32(reinterpret_cast<const float*>(p1 + x + 4));
-      float32x4_t p1_f2 = vld1q_f32(reinterpret_cast<const float*>(p1 + x + 8));
-      float32x4_t p1_f3 = vld1q_f32(reinterpret_cast<const float*>(p1 + x + 12));
-
-      float32x4_t p2_f0 = vld1q_f32(reinterpret_cast<const float*>(p2 + x + 0));
-      float32x4_t p2_f1 = vld1q_f32(reinterpret_cast<const float*>(p2 + x + 4));
-      float32x4_t p2_f2 = vld1q_f32(reinterpret_cast<const float*>(p2 + x + 8));
-      float32x4_t p2_f3 = vld1q_f32(reinterpret_cast<const float*>(p2 + x + 12));
-
-      float32x4_t mask0, mask1, mask2, mask3;
-      if constexpr (has_mask) {
-        mask0 = vld1q_f32(reinterpret_cast<const float*>(mask + x + 0));
-        mask1 = vld1q_f32(reinterpret_cast<const float*>(mask + x + 4));
-        mask2 = vld1q_f32(reinterpret_cast<const float*>(mask + x + 8));
-        mask3 = vld1q_f32(reinterpret_cast<const float*>(mask + x + 12));
-        mask0 = vmulq_f32(mask0, opacity_v);
-        mask1 = vmulq_f32(mask1, opacity_v);
-        mask2 = vmulq_f32(mask2, opacity_v);
-        mask3 = vmulq_f32(mask3, opacity_v);
-      }
-      else {
-        mask0 = opacity_v;
-        mask1 = opacity_v;
-        mask2 = opacity_v;
-        mask3 = opacity_v;
-      }
-
-      float32x4_t result0 = vaddq_f32(p1_f0, vmulq_f32(vsubq_f32(p2_f0, p1_f0), mask0));
-      float32x4_t result1 = vaddq_f32(p1_f1, vmulq_f32(vsubq_f32(p2_f1, p1_f1), mask1));
-      float32x4_t result2 = vaddq_f32(p1_f2, vmulq_f32(vsubq_f32(p2_f2, p1_f2), mask2));
-      float32x4_t result3 = vaddq_f32(p1_f3, vmulq_f32(vsubq_f32(p2_f3, p1_f3), mask3));
-
-      vst1q_f32(reinterpret_cast<float*>(p1 + x + 0), result0);
-      vst1q_f32(reinterpret_cast<float*>(p1 + x + 4), result1);
-      vst1q_f32(reinterpret_cast<float*>(p1 + x + 8), result2);
-      vst1q_f32(reinterpret_cast<float*>(p1 + x + 12), result3);
-    }
-
-    // Leftover value
-    for (int x = wMod16 / sizeof(float); x < width; x++) {
-      auto new_mask = has_mask ? reinterpret_cast<const float*>(mask)[x] * opacity_f : opacity_f;
-      auto p1x = reinterpret_cast<float*>(p1)[x];
-      auto p2x = reinterpret_cast<const float*>(p2)[x];
-      auto result = p1x + (p2x - p1x) * new_mask;
-      reinterpret_cast<float*>(p1)[x] = result;
-    }
-
-    p1 += p1_pitch;
-    p2 += p2_pitch;
-    if constexpr (has_mask)
-      mask += mask_pitch;
-  }
-}
-
-// instantiate
-template void overlay_blend_neon_float<false>(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch, const int width, const int height, const int /*opacity*/, const float opacity_f, const int bits_per_pixel);
-template void overlay_blend_neon_float<true>(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch, const int width, const int height, const int /*opacity*/, const float opacity_f, const int bits_per_pixel);
-
 void overlay_darken_neon(BYTE* p1Y, BYTE* p1U, BYTE* p1V, const BYTE* p2Y, const BYTE* p2U, const BYTE* p2V, int p1_pitch, int p2_pitch, int width, int height) {
   overlay_darklighten_neon<overlay_darken_neon_cmp, overlay_darken_c_cmp>(p1Y, p1U, p1V, p2Y, p2U, p2V, p1_pitch, p2_pitch, width, height);
 }
 void overlay_lighten_neon(BYTE* p1Y, BYTE* p1U, BYTE* p1V, const BYTE* p2Y, const BYTE* p2U, const BYTE* p2V, int p1_pitch, int p2_pitch, int width, int height) {
   overlay_darklighten_neon<overlay_lighten_neon_cmp, overlay_lighten_c_cmp>(p1Y, p1U, p1V, p2Y, p2U, p2V, p1_pitch, p2_pitch, width, height);
+}
+
+// ---------------------------------------------------------------------------
+// Overlay blend masked getter — returns masked_merge_neon_dispatch instantiation.
+// is_chroma=false → always MASK444 (luma).
+// is_chroma=true  → placement-aware maskMode (chroma).
+// ---------------------------------------------------------------------------
+masked_merge_fn_t* get_overlay_blend_masked_fn_neon(bool is_chroma, MaskMode maskMode)
+{
+#define DISPATCH_OVERLAY_BLEND_NEON(MaskType) \
+  return is_chroma ? masked_merge_neon_dispatch<MaskType> \
+                   : masked_merge_neon_dispatch<MASK444>;
+
+  switch (maskMode) {
+  case MASK444:          DISPATCH_OVERLAY_BLEND_NEON(MASK444)
+  case MASK420:          DISPATCH_OVERLAY_BLEND_NEON(MASK420)
+  case MASK420_MPEG2:    DISPATCH_OVERLAY_BLEND_NEON(MASK420_MPEG2)
+  case MASK420_TOPLEFT:  DISPATCH_OVERLAY_BLEND_NEON(MASK420_TOPLEFT)
+  case MASK422:          DISPATCH_OVERLAY_BLEND_NEON(MASK422)
+  case MASK422_MPEG2:    DISPATCH_OVERLAY_BLEND_NEON(MASK422_MPEG2)
+  case MASK422_TOPLEFT:  DISPATCH_OVERLAY_BLEND_NEON(MASK422_TOPLEFT)
+  case MASK411:          DISPATCH_OVERLAY_BLEND_NEON(MASK411)
+  }
+#undef DISPATCH_OVERLAY_BLEND_NEON
+  return masked_merge_neon_dispatch<MASK444>; // unreachable
 }

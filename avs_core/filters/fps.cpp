@@ -669,16 +669,16 @@ PVideoFrame __stdcall ConvertFPS::GetFrame(int n, IScriptEnvironment* env)
       int          row_size = a->GetRowSize(plane);
       int          height = a->GetHeight(plane);
 
-      int weight_i;
-      int invweight_i;
-      float weight = (float)frac_f; // between 0 and 1.0
-
-#ifdef INTEL_INTRINSICS
-      MergeFuncPtr weighted_merge_planar = getMergeFunc(bits_per_pixel, env->GetCPUFlags(), a_data, b_data, weight, /*out*/weight_i, /*out*/invweight_i);
-#else
-      MergeFuncPtr weighted_merge_planar = getMergeFunc(bits_per_pixel, a_data, b_data, weight, /*out*/weight_i, /*out*/invweight_i);
-#endif
-      weighted_merge_planar(a_data, b_data, a_pitch, b_pitch, row_size, height, weight, weight_i, invweight_i);
+      const float weight = (float)frac_f; // between 0 and 1.0
+      const int pixelsize = bits_per_pixel <= 8 ? 1 : (bits_per_pixel == 32 ? 4 : 2);
+      const int width = row_size / pixelsize;
+      const int cpuFlags = env->GetCPUFlags();
+      if (bits_per_pixel == 32) {
+        get_weighted_merge_float_fn(cpuFlags)(a_data, b_data, a_pitch, b_pitch, width, height, weight);
+      } else {
+        const int weight_i = (int)(weight * 32768.0f + 0.5f);
+        get_weighted_merge_fn(cpuFlags)(a_data, b_data, a_pitch, b_pitch, width, height, weight_i, 32768 - weight_i, bits_per_pixel);
+      }
     }
 
     return a;

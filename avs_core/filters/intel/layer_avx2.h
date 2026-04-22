@@ -74,24 +74,26 @@ void get_layer_yuv_mul_functions_avx2(
   layer_yuv_mul_c_t** layer_fn,
   layer_yuv_mul_f_c_t** layer_f_fn);
 
-template<bool is_subtract>
-void get_layer_yuv_add_subtract_functions_avx2(
+void get_layer_yuv_add_functions_avx2(
   bool is_chroma, bool use_chroma, bool hasAlpha,
   int placement, VideoInfo& vi, int bits_per_pixel,
-  layer_yuv_add_subtract_c_t** layer_fn,
-  layer_yuv_add_subtract_f_c_t** layer_f_fn);
+  layer_yuv_add_c_t** layer_fn,
+  layer_yuv_add_f_c_t** layer_f_fn);
 
-void get_layer_planarrgb_lighten_darken_functions_avx2(bool isLighten, bool hasAlpha, int bits_per_pixel, /*out*/layer_planarrgb_lighten_darken_c_t** layer_fn, /*out*/layer_planarrgb_lighten_darken_f_c_t** layer_f_fn);
+void get_layer_planarrgb_lighten_darken_functions_avx2(bool isLighten, bool hasAlpha, bool blendAlpha, int bits_per_pixel, /*out*/layer_planarrgb_lighten_darken_c_t** layer_fn, /*out*/layer_planarrgb_lighten_darken_f_c_t** layer_f_fn);
 
-template<bool is_subtract>
-void get_layer_planarrgb_add_subtract_functions_avx2(
-  bool chroma, bool hasAlpha, int bits_per_pixel,
-  /*out*/layer_planarrgb_add_subtract_c_t** layer_fn,
-  /*out*/layer_planarrgb_add_subtract_f_c_t** layer_f_fn);
+void get_layer_planarrgb_add_functions_avx2(
+  bool chroma, bool hasAlpha, bool blendAlpha, int bits_per_pixel,
+  /*out*/layer_planarrgb_add_c_t** layer_fn,
+  /*out*/layer_planarrgb_add_f_c_t** layer_f_fn);
 
 void get_layer_planarrgb_mul_functions_avx2(
-  bool chroma, bool hasAlpha, int bits_per_pixel,
+  bool chroma, bool hasAlpha, bool blendAlpha, int bits_per_pixel,
   layer_planarrgb_mul_c_t** layer_fn,
   layer_planarrgb_mul_f_c_t** layer_f_fn);
+
+void get_layer_packedrgb_blend_functions_avx2(
+  bool has_separate_mask, int bits_per_pixel,
+  layer_packedrgb_blend_c_t** fn);
 
 #endif  // __Layer_SSE_H__

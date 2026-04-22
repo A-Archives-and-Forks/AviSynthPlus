@@ -43,14 +43,19 @@
 #include <immintrin.h>
 
 #include <cstdint>
+#include <vector>
 
 #include <avs/minmax.h>
 #include <avs/alignment.h>
 #include "../core/internal.h"
 
+// masked_merge_avx2_impl<maskMode> — implementation-include, no guards.
+#include "../overlay/intel/masked_merge_avx2_impl.hpp"
+
 #include "../convert/convert_planar.h"
 #include <algorithm>
 #include <vector>
+#include <type_traits>
 
 // Mostly RGB32 stuff, unaligned addresses, pixels grouped by 4
 
@@ -177,7 +182,7 @@ void invert_plane_avx2_u8(uint8_t* dstp, const uint8_t* srcp, int src_pitch, int
   const __m256i v_ff  = _mm256_set1_epi8((char)0xFF);
   const __m256i v_one = _mm256_set1_epi8(1);
 
-      for (int y = 0; y < height; ++y) {
+  for (int y = 0; y < height; ++y) {
     int x = 0;
     for (int x = 0; x < width; x += 32) {
       __m256i s = _mm256_load_si256(reinterpret_cast<const __m256i*>(srcp + x));
@@ -187,11 +192,11 @@ void invert_plane_avx2_u8(uint8_t* dstp, const uint8_t* srcp, int src_pitch, int
       else
         r = _mm256_xor_si256(s, v_ff);
       _mm256_store_si256(reinterpret_cast<__m256i*>(dstp + x), r);
-        }
-        srcp += src_pitch;
-        dstp += dst_pitch;
-      }
     }
+    srcp += src_pitch;
+    dstp += dst_pitch;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // invert_plane_avx2_u16: 10/12/14/16-bit luma/chroma inversion.
@@ -208,7 +213,7 @@ void invert_plane_avx2_u16(uint8_t* dstp, const uint8_t* srcp, int src_pitch, in
   const __m256i v_max = _mm256_set1_epi16((short)max_pixel_value);
   const __m256i v_one = _mm256_set1_epi16(1);
 
-      for (int y = 0; y < height; ++y) {
+  for (int y = 0; y < height; ++y) {
     const uint16_t* s16 = reinterpret_cast<const uint16_t*>(srcp);
           uint16_t* d16 = reinterpret_cast<      uint16_t*>(dstp);
     
@@ -220,11 +225,11 @@ void invert_plane_avx2_u16(uint8_t* dstp, const uint8_t* srcp, int src_pitch, in
       else
         r = _mm256_xor_si256(s, v_max);
       _mm256_store_si256(reinterpret_cast<__m256i*>(d16 + x), r);
-        }
-        srcp += src_pitch;
-        dstp += dst_pitch;
-      }
     }
+    srcp += src_pitch;
+    dstp += dst_pitch;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // invert_plane_avx2_f32: 32-bit float luma/chroma inversion.
@@ -237,7 +242,7 @@ void invert_plane_avx2_f32(uint8_t* dstp, const uint8_t* srcp, int src_pitch, in
   const __m256 v_one  = _mm256_set1_ps(1.0f);
   const __m256 v_sign = _mm256_set1_ps(-0.0f); // 0x80000000 — sign-flip mask
 
-      for (int y = 0; y < height; ++y) {
+  for (int y = 0; y < height; ++y) {
     const float* sf = reinterpret_cast<const float*>(srcp);
           float* df = reinterpret_cast<      float*>(dstp);
     
@@ -249,11 +254,11 @@ void invert_plane_avx2_f32(uint8_t* dstp, const uint8_t* srcp, int src_pitch, in
       else
         r = _mm256_sub_ps(v_one, s);
       _mm256_store_ps(df + x, r);
-        }
-        srcp += src_pitch;
-        dstp += dst_pitch;
-      }
     }
+    srcp += src_pitch;
+    dstp += dst_pitch;
+  }
+}
 
 template void invert_plane_avx2_u8<false>(uint8_t*, const uint8_t*, int, int, int, int, int);
 template void invert_plane_avx2_u8<true> (uint8_t*, const uint8_t*, int, int, int, int, int);
@@ -270,7 +275,14 @@ template void invert_plane_avx2_f32<true> (uint8_t*, const uint8_t*, int, int, i
  // chroma placement to mask helpers
  // yuv add, subtract, mul, lighten, darken
  // included in base and the avx2 source module, to get different optimizations
+ // Use AVX2 SIMD rowprep variants — masked_rowprep_avx2.hpp is already included above
+ // via masked_merge_avx2_impl.hpp.  Both prepare_effective_mask_for_row_avx2 and
+ // prepare_effective_mask_for_row_level_baked_avx2 are therefore visible here.
+#define LAYER_ROWPREP_FN       prepare_effective_mask_for_row_avx2
+#define LAYER_ROWPREP_LEVEL_FN prepare_effective_mask_for_row_level_baked_avx2
 #include "../layer.hpp"
+#undef LAYER_ROWPREP_FN
+#undef LAYER_ROWPREP_LEVEL_FN
 
 
 // Wrapper function that calls the local scoped get_layer_yuv_mul_functions
@@ -284,64 +296,267 @@ void get_layer_yuv_mul_functions_avx2(
   get_layer_yuv_mul_functions(is_chroma, use_chroma, hasAlpha, placement, vi, bits_per_pixel, layer_fn, layer_f_fn);
 }
 
-// Template wrapper for add/subtract
-template<bool is_subtract>
-void get_layer_yuv_add_subtract_functions_avx2(
+// ---------------------------------------------------------------------------
+// AVX2 Layer add dispatcher.
+// Selects masked_merge_avx2_impl<maskMode> for integer hasAlpha=true,
+// use_chroma=true cases; falls through to C templates for float,
+// hasAlpha=false, or use_chroma=false (blend-toward-neutral).
+// subtract is handled by pre-inverting the overlay in Layer::Create.
+// ---------------------------------------------------------------------------
+void get_layer_yuv_add_functions_avx2(
   bool is_chroma, bool use_chroma, bool hasAlpha,
   int placement, VideoInfo& vi, int bits_per_pixel,
-  /*out*/layer_yuv_add_subtract_c_t** layer_fn,
-  /*out*/layer_yuv_add_subtract_f_c_t** layer_f_fn)
+  /*out*/layer_yuv_add_c_t** layer_fn,
+  /*out*/layer_yuv_add_f_c_t** layer_f_fn)
 {
-  get_layer_yuv_add_subtract_functions<is_subtract>(is_chroma, use_chroma, hasAlpha, placement, vi, bits_per_pixel, layer_fn, layer_f_fn);
+  // Conditions where AVX2 masked_merge doesn't apply:
+  //  - float (no integer AVX2 path for float)
+  //  - no alpha mask (blend uses flat weight, not mask; different arithmetic)
+  //  - use_chroma=false with is_chroma=true (blend-toward-neutral, different formula)
+  if (bits_per_pixel == 32 || !hasAlpha || (is_chroma && !use_chroma)) {
+    get_layer_yuv_add_functions(
+      is_chroma, use_chroma, hasAlpha, placement, vi, bits_per_pixel, layer_fn, layer_f_fn);
+    return;
+  }
+
+  // Use the unified (Layer,Overlay) masked merge functions
+  // Determine MaskMode from format and placement
+  MaskMode maskMode = MASK444;
+  if (is_chroma) {
+    if (vi.IsYV411())
+      maskMode = MASK411;
+    else if (vi.Is420())
+      maskMode = (placement == PLACEMENT_MPEG1) ? MASK420 : (placement == PLACEMENT_TOPLEFT) ? MASK420_TOPLEFT : MASK420_MPEG2;
+    else if (vi.Is422())
+      maskMode = (placement == PLACEMENT_MPEG1) ? MASK422 : (placement == PLACEMENT_TOPLEFT) ? MASK422_TOPLEFT : MASK422_MPEG2;
+    // Is444() / IsY(): stay MASK444
+  }
+  // is_chroma=false (luma): always MASK444
+
+  // Dispatch to the appropriate AVX2 instantiation.
+  // For luma (is_chroma=false): always MASK444.
+  // For chroma (is_chroma=true, use_chroma=true): placement-aware maskMode.
+#define DISPATCH_LUMA_CHROMA_AVX2(MaskType) \
+  if (is_chroma) *layer_fn = masked_merge_avx2_impl<MaskType>; \
+  else           *layer_fn = masked_merge_avx2_impl<MASK444>;
+
+  switch (maskMode) {
+  case MASK444:          DISPATCH_LUMA_CHROMA_AVX2(MASK444)          break;
+  case MASK420:          DISPATCH_LUMA_CHROMA_AVX2(MASK420)          break;
+  case MASK420_MPEG2:    DISPATCH_LUMA_CHROMA_AVX2(MASK420_MPEG2)    break;
+  case MASK420_TOPLEFT:  DISPATCH_LUMA_CHROMA_AVX2(MASK420_TOPLEFT)  break;
+  case MASK422:          DISPATCH_LUMA_CHROMA_AVX2(MASK422)          break;
+  case MASK422_MPEG2:    DISPATCH_LUMA_CHROMA_AVX2(MASK422_MPEG2)    break;
+  case MASK422_TOPLEFT:  DISPATCH_LUMA_CHROMA_AVX2(MASK422_TOPLEFT)  break;
+  case MASK411:          DISPATCH_LUMA_CHROMA_AVX2(MASK411)          break;
+  }
+#undef DISPATCH_LUMA_CHROMA_AVX2
 }
 
-// Explicit template instantiations - forces the linker to generate both versions
-template void get_layer_yuv_add_subtract_functions_avx2<false>(
-  bool is_chroma, bool use_chroma, bool hasAlpha,
-  int placement, VideoInfo& vi, int bits_per_pixel,
-  layer_yuv_add_subtract_c_t** layer_fn,
-  layer_yuv_add_subtract_f_c_t** layer_f_fn);
 
-template void get_layer_yuv_add_subtract_functions_avx2<true>(
-  bool is_chroma, bool use_chroma, bool hasAlpha,
-  int placement, VideoInfo& vi, int bits_per_pixel,
-  layer_yuv_add_subtract_c_t** layer_fn,
-  layer_yuv_add_subtract_f_c_t** layer_f_fn);
-
-
-void get_layer_planarrgb_lighten_darken_functions_avx2(bool isLighten, bool hasAlpha, int bits_per_pixel, /*out*/layer_planarrgb_lighten_darken_c_t** layer_fn, /*out*/layer_planarrgb_lighten_darken_f_c_t** layer_f_fn) {
-  get_layer_planarrgb_lighten_darken_functions(isLighten, hasAlpha, bits_per_pixel, layer_fn, layer_f_fn);
+void get_layer_planarrgb_lighten_darken_functions_avx2(bool isLighten, bool hasAlpha, bool blendAlpha, int bits_per_pixel, /*out*/layer_planarrgb_lighten_darken_c_t** layer_fn, /*out*/layer_planarrgb_lighten_darken_f_c_t** layer_f_fn) {
+  get_layer_planarrgb_lighten_darken_functions(isLighten, hasAlpha, blendAlpha, bits_per_pixel, layer_fn, layer_f_fn);
 }
 
 
-// In layer_avx2.cpp
-template<bool is_subtract>
-void get_layer_planarrgb_add_subtract_functions_avx2(
-  bool chroma, bool hasAlpha, int bits_per_pixel,
-  /*out*/layer_planarrgb_add_subtract_c_t** layer_fn,
-  /*out*/layer_planarrgb_add_subtract_f_c_t** layer_f_fn)
+// Planar RGB add — AVX2 per-plane wrappers.
+// All planar RGB planes are at full luma resolution (MASK444).
+// maskp8 is the per-pixel blend weight (overlay A, or saved pre-Subtract A from mask_child).
+// ovrp8[i] is the blend target for each colour plane; for blend_alpha, ovrp8[3] is the alpha target.
+// Subtract is handled by pre-inverting the overlay in Layer::Create.
+// chroma=false (blend-toward-neutral luma) and float fall back to C templates.
+
+static void layer_planarrgb_add_avx2_3plane(
+  BYTE** dstp8, const BYTE** ovrp8, const BYTE* maskp8,
+  int dst_pitch, int overlay_pitch, int mask_pitch,
+  int width, int height, int level, int bits_per_pixel)
 {
-  get_layer_planarrgb_add_subtract_functions<is_subtract>(chroma, hasAlpha, bits_per_pixel, layer_fn, layer_f_fn);
+  for (int i = 0; i < 3; i++)
+    masked_merge_avx2_impl<MASK444>(
+      dstp8[i], ovrp8[i], maskp8,
+      dst_pitch, overlay_pitch, mask_pitch,
+      width, height, level, bits_per_pixel);
 }
 
-// Explicit instantiations
-template void get_layer_planarrgb_add_subtract_functions_avx2<false>(
-  bool chroma, bool hasAlpha, int bits_per_pixel,
-  layer_planarrgb_add_subtract_c_t** layer_fn,
-  layer_planarrgb_add_subtract_f_c_t** layer_f_fn);
+static void layer_planarrgb_add_avx2_4plane(
+  BYTE** dstp8, const BYTE** ovrp8, const BYTE* maskp8,
+  int dst_pitch, int overlay_pitch, int mask_pitch,
+  int width, int height, int level, int bits_per_pixel)
+{
+  for (int i = 0; i < 4; i++)
+    masked_merge_avx2_impl<MASK444>(
+      dstp8[i], ovrp8[i], maskp8,
+      dst_pitch, overlay_pitch, mask_pitch,
+      width, height, level, bits_per_pixel);
+}
 
-template void get_layer_planarrgb_add_subtract_functions_avx2<true>(
-  bool chroma, bool hasAlpha, int bits_per_pixel,
-  layer_planarrgb_add_subtract_c_t** layer_fn,
-  layer_planarrgb_add_subtract_f_c_t** layer_f_fn);
+// In layer_avx2.cpp — subtract handled by pre-inverted overlay in Layer::Create.
+void get_layer_planarrgb_add_functions_avx2(
+  bool chroma, bool hasAlpha, bool blendAlpha, int bits_per_pixel,
+  /*out*/layer_planarrgb_add_c_t** layer_fn,
+  /*out*/layer_planarrgb_add_f_c_t** layer_f_fn)
+{
+  // Integer + hasAlpha + chroma=true: dispatch per-plane to masked_merge_avx2_impl (MASK444).
+  // chroma=false (blend toward luma) has a different formula — keep C template.
+  // float: keep C template (float perf is usually fine; could add later).
+  if (hasAlpha && chroma && bits_per_pixel != 32) {
+    *layer_fn = blendAlpha ? layer_planarrgb_add_avx2_4plane : layer_planarrgb_add_avx2_3plane;
+    return;
+  }
+  get_layer_planarrgb_add_functions(chroma, hasAlpha, blendAlpha, bits_per_pixel, layer_fn, layer_f_fn);
+}
 
 
 void get_layer_planarrgb_mul_functions_avx2(
-  bool chroma, bool hasAlpha, int bits_per_pixel,
+  bool chroma, bool hasAlpha, bool blendAlpha, int bits_per_pixel,
   /*out*/layer_planarrgb_mul_c_t** layer_fn,
   /*out*/layer_planarrgb_mul_f_c_t** layer_f_fn)
 {
-  get_layer_planarrgb_mul_functions(chroma, hasAlpha, bits_per_pixel, layer_fn, layer_f_fn);
+  get_layer_planarrgb_mul_functions(chroma, hasAlpha, blendAlpha, bits_per_pixel, layer_fn, layer_f_fn);
+}
+
+// ---------------------------------------------------------------------------
+// Packed RGBA (RGB32) magic-div blend — AVX2, 8-bit only.
+//
+// Processes 8 BGRA pixels (32 bytes) per iteration.
+//
+// Per-pixel blend weight source (compile-time):
+//   has_separate_mask=false → alpha from ovr[x*4+3]  (Add: overlay's own alpha)
+//   has_separate_mask=true  → alpha from maskp8[x]   (Subtract: original alpha
+//                              extracted before pre-inverting overlay in Create)
+//
+// Per-channel result: (dst * (255-aeff) + ovr * aeff + 127) / 255
+// For Subtract, ovr is already pre-inverted (max - original) by Create().
+//
+// ÷255 is implemented as  mulhi_epu16(x, 0x8081) >> 7  — the standard
+// "magic multiply" for dividing 16-bit values by 255 (exact for [0..65280]).
+// All intermediate sums stay within uint16 because:
+//   alpha_eff in [0..255], inv = 255-alpha_eff
+//   dst*inv + ovr*alpha ≤ 255*(inv+alpha) = 255*255 = 65025 < 65536
+//   + half(127) → max 65152 < 65536
+//
+// 16-bit pixels (RGB64) fall through to the C reference via the dispatcher.
+// ---------------------------------------------------------------------------
+template<bool has_separate_mask>
+static void masked_blend_packedrgba_avx2_u8(
+  BYTE* dstp8, const BYTE* ovrp8, const BYTE* maskp8,
+  int dst_pitch, int ovr_pitch, int mask_pitch,
+  int width, int height, int opacity_i)
+{
+  // Shuffle mask: replicate byte 3 (A) of each BGRA pixel across all 4 bytes.
+  // AVX2 _mm256_shuffle_epi8 operates independently in each 128-bit lane,
+  // so lanes 0 and 1 use identical 16-byte shuffle patterns.
+  const __m256i shuf_alpha_bgra = _mm256_set_epi8(
+    15,15,15,15, 11,11,11,11,  7, 7, 7, 7,  3, 3, 3, 3,   // lane 1 (pixels 4-7)
+    15,15,15,15, 11,11,11,11,  7, 7, 7, 7,  3, 3, 3, 3);  // lane 0 (pixels 0-3)
+  // Shuffle for separate mask: 8 bytes m0..m7 → each byte broadcast to 4 positions.
+  // Applies within each 128-bit lane independently:
+  //   lane 0: bytes 0-7 of mask → pixels 0-3 of lane (m0,m0,m0,m0, m1,m1,m1,m1, ...)
+  //   lane 1: bytes 0-7 of mask → pixels 4-7 of lane (m4,m4,m4,m4, m5,m5,m5,m5, ...)
+  const __m256i shuf_alpha_mask = _mm256_set_epi8(
+     3, 3, 3, 3,  2, 2, 2, 2,  1, 1, 1, 1,  0, 0, 0, 0,  // lane 1: mask bytes 4-7
+     3, 3, 3, 3,  2, 2, 2, 2,  1, 1, 1, 1,  0, 0, 0, 0); // lane 0: mask bytes 0-3
+
+  const __m256i v_opacity = _mm256_set1_epi16((short)opacity_i);
+  const __m256i v_half    = _mm256_set1_epi16(127);
+  const __m256i v_max     = _mm256_set1_epi16(255);
+  const __m256i v_magic   = _mm256_set1_epi16((short)0x8081u); // magic for ÷255
+
+  // magic ÷255: mulhi_epu16(x, 0x8081) >> 7  ≡  (x * 32897) >> 23
+  auto div255 = [&](__m256i x) -> __m256i {
+    return _mm256_srli_epi16(_mm256_mulhi_epu16(x, v_magic), 7);
+  };
+
+  const int mod8_width = width / 8 * 8;
+
+  for (int y = 0; y < height; ++y) {
+    int x = 0;
+    for (; x < mod8_width; x += 8) {
+      __m256i dst8 = _mm256_loadu_si256((const __m256i*)(dstp8 + x * 4));
+      __m256i ovr8 = _mm256_loadu_si256((const __m256i*)(ovrp8 + x * 4));
+
+      // Broadcast per-pixel alpha to all 4 channel bytes within each pixel.
+      __m256i alpha_bcast;
+      if constexpr (has_separate_mask) {
+        // Load 8 mask bytes (one per pixel), distribute across two 128-bit lanes.
+        __m128i mask8b = _mm_loadl_epi64((const __m128i*)(maskp8 + x)); // lo 8 bytes
+        // Place bytes 0-3 in lane 0 and bytes 4-7 in lane 1 of a 256-bit register.
+        __m256i mask_wide = _mm256_inserti128_si256(
+          _mm256_castsi128_si256(mask8b),
+          _mm_srli_si128(mask8b, 4), 1);
+        alpha_bcast = _mm256_shuffle_epi8(mask_wide, shuf_alpha_mask);
+      } else {
+        alpha_bcast = _mm256_shuffle_epi8(ovr8, shuf_alpha_bgra);
+      }
+
+      // Expand all channels to 16-bit (two 256-bit registers: lo=px0-3, hi=px4-7).
+      __m256i dst_lo  = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(dst8));
+      __m256i dst_hi  = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(dst8, 1));
+      __m256i ovr_lo  = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(ovr8));
+      __m256i ovr_hi  = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(ovr8, 1));
+      __m256i a_lo    = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(alpha_bcast));
+      __m256i a_hi    = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(alpha_bcast, 1));
+
+      // alpha_eff = (alpha * opacity_i + 127) / 255
+      __m256i aeff_lo = div255(_mm256_add_epi16(_mm256_mullo_epi16(a_lo, v_opacity), v_half));
+      __m256i aeff_hi = div255(_mm256_add_epi16(_mm256_mullo_epi16(a_hi, v_opacity), v_half));
+      __m256i inv_lo  = _mm256_sub_epi16(v_max, aeff_lo);
+      __m256i inv_hi  = _mm256_sub_epi16(v_max, aeff_hi);
+
+      // b = ovr (overlay pre-inverted for Subtract; plain for Add)
+      const __m256i b_lo = ovr_lo;
+      const __m256i b_hi = ovr_hi;
+
+      // result = (dst * inv + b * aeff + 127) / 255
+      __m256i res_lo = div255(_mm256_add_epi16(
+        _mm256_add_epi16(_mm256_mullo_epi16(dst_lo, inv_lo),
+                         _mm256_mullo_epi16(b_lo,   aeff_lo)), v_half));
+      __m256i res_hi = div255(_mm256_add_epi16(
+        _mm256_add_epi16(_mm256_mullo_epi16(dst_hi, inv_hi),
+                         _mm256_mullo_epi16(b_hi,   aeff_hi)), v_half));
+
+      // Pack 16→8-bit.  _mm256_packus_epi16 interleaves lanes: [p0p1 p4p5 | p2p3 p6p7].
+      // _mm256_permute4x64_epi64(..., 0xD8) reorders 64-bit groups [0,2,1,3] to [p0-p7].
+      __m256i result = _mm256_permute4x64_epi64(
+        _mm256_packus_epi16(res_lo, res_hi), 0xD8);
+
+      _mm256_storeu_si256((__m256i*)(dstp8 + x * 4), result);
+    }
+
+    // Scalar tail (width not a multiple of 8).
+    constexpr MagicDiv magic8 = get_magic_div(8);
+    for (; x < width; ++x) {
+      const uint32_t alpha_src = has_separate_mask
+        ? (uint32_t)maskp8[x]
+        : (uint32_t)ovrp8[x * 4 + 3];
+      const uint32_t ae = (uint32_t)magic_div_rt<uint8_t>(
+        alpha_src * (uint32_t)opacity_i + 127u, magic8);
+      const uint32_t iv = 255u - ae;
+      for (int ch = 0; ch < 4; ++ch) {
+        dstp8[x * 4 + ch] = (BYTE)magic_div_rt<uint8_t>(
+          (uint32_t)dstp8[x * 4 + ch] * iv + (uint32_t)ovrp8[x * 4 + ch] * ae + 127u, magic8);
+      }
+    }
+
+    dstp8 += dst_pitch;
+    ovrp8 += ovr_pitch;
+    if constexpr (has_separate_mask) maskp8 += mask_pitch;
+  }
+}
+
+// Dispatcher: 8-bit only; 16-bit falls back to C reference.
+// has_separate_mask=false → Add  (alpha from ovrp8[x*4+3])
+// has_separate_mask=true  → Subtract (alpha from maskp8[x], overlay pre-inverted)
+void get_layer_packedrgb_blend_functions_avx2(
+  bool has_separate_mask, int bits_per_pixel,
+  layer_packedrgb_blend_c_t** fn)
+{
+  if (bits_per_pixel == 8) {
+    *fn = has_separate_mask ? masked_blend_packedrgba_avx2_u8<true>
+                            : masked_blend_packedrgba_avx2_u8<false>;
+    return;
+  }
+  get_layer_packedrgb_blend_functions(bits_per_pixel, fn);
 }
 
 

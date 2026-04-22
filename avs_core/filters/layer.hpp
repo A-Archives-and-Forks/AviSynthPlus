@@ -1,173 +1,45 @@
 
 // Basic utils in C++ language, to be included in both base and processor specific (e.g. avx2) source modules, where they can
 // be optimized for the specific instruction set.
-// Chroma placement to mask helpers, yuv add, subtract, mul, lighten, darken
+// yuv add, subtract, mul, lighten, darken
+// Chroma placement helpers (calculate_effective_mask*, prepare_effective_mask_for_row*)
+// are now in overlay/blend_common.h, pulled in via layer.h.
+
+// ---------------------------------------------------------------------------
+// Rowprep function selectors — defined by the including TU to inject SIMD variants.
+// Default: C scalar functions from overlay/blend_common.h.
+//
+// LAYER_ROWPREP_FN      — spatial averaging (+ Overlay-style opacity baking when
+//                          full_opacity=false; not used for Layer's level scaling).
+//                          Used for the full_opacity=true path: returns spatial
+//                          averages (or maskp directly for MASK444).
+//
+// LAYER_ROWPREP_LEVEL_FN — Layer-style baking: (avg * level + 1) >> bpp.
+//                          Used for the full_opacity=false path.
+//
+// Including TU (e.g. layer_avx2.cpp) defines them before this #include:
+//   #define LAYER_ROWPREP_FN       prepare_effective_mask_for_row_avx2
+//   #define LAYER_ROWPREP_LEVEL_FN prepare_effective_mask_for_row_level_baked_avx2
+// ---------------------------------------------------------------------------
+#ifndef LAYER_ROWPREP_FN
+#  define LAYER_ROWPREP_FN  prepare_effective_mask_for_row
+#endif
+#ifndef LAYER_ROWPREP_LEVEL_FN
+#  define LAYER_ROWPREP_LEVEL_FN  prepare_effective_mask_for_row_level_baked
+#endif
 
 DISABLE_WARNING_PUSH
 DISABLE_WARNING_UNREFERENCED_LOCAL_VARIABLE
-
-// Single function for all cases
-
-// Helper function for calculation of effective mask value for a pixel, based on chroma placement
-// integer 8-16 bits version, with in/out parameter for MPEG2 sliding window modes
-template<MaskMode maskMode, typename pixel_t>
-AVS_FORCEINLINE static int calculate_effective_mask(
-  const pixel_t* ptr,
-  int x,
-  int pitch,
-  int& right_value  // in/out parameter for MPEG2 sliding window modes
-) {
-  if constexpr (maskMode == MASK444) {
-    // +------+
-    // | 1.0  |
-    // +------+
-    return ptr[x];
-  }
-  else if constexpr (maskMode == MASK411) {
-    // +------+------+------+------+
-    // | 0.25 | 0.25 | 0.25 | 0.25 |
-    // +------+------+------+------+
-    return (ptr[x * 4] + ptr[x * 4 + 1] + ptr[x * 4 + 2] + ptr[x * 4 + 3] + 2) >> 2;
-  }
-  else if constexpr (maskMode == MASK420) {
-    // +------+------+
-    // | 0.25 | 0.25 |
-    // |------+------|
-    // | 0.25 | 0.25 |
-    // +------+------+
-    return (ptr[x * 2] + ptr[x * 2 + 1] + ptr[x * 2 + pitch] + ptr[x * 2 + 1 + pitch] + 2) >> 2;
-  }
-  else if constexpr (maskMode == MASK420_MPEG2) {
-    // ------+------+-------+
-    // 0.125 | 0.25 | 0.125 |
-    // ------|------+-------|
-    // 0.125 | 0.25 | 0.125 |
-    // ------+------+-------+
-    int left = right_value;
-    const int mid = ptr[x * 2] + ptr[x * 2 + pitch];
-    right_value = ptr[x * 2 + 1] + ptr[x * 2 + 1 + pitch];
-    return (left + 2 * mid + right_value + 4) >> 3;
-  }
-  else if constexpr (maskMode == MASK422) {
-    // +------+------+
-    // | 0.5  | 0.5  |
-    // +------+------+
-    return (ptr[x * 2] + ptr[x * 2 + 1] + 1) >> 1;
-  }
-  else if constexpr (maskMode == MASK422_MPEG2) {
-    // ------+------+-------+
-    // 0.25  | 0.5  | 0.25  |
-    // ------+------+-------+
-    int left = right_value;
-    const int mid = ptr[x * 2];
-    right_value = ptr[x * 2 + 1];
-    return (left + 2 * mid + right_value + 2) >> 2;
-  }
-}
-
-// Helper function for calculation of effective mask value for a pixel, based on chroma placement
-// Float version, with in/out parameter for MPEG2 sliding window modes
-template<MaskMode maskMode>
-AVS_FORCEINLINE static float calculate_effective_mask_f(
-  const float* ptr,
-  int x,
-  int pitch,
-  float& right_value  // in/out parameter for MPEG2 sliding window modes
-) {
-  if constexpr (maskMode == MASK444) {
-    return ptr[x];
-  }
-  else if constexpr (maskMode == MASK411) {
-    return (ptr[x * 4] + ptr[x * 4 + 1] + ptr[x * 4 + 2] + ptr[x * 4 + 3]) * 0.25f;
-  }
-  else if constexpr (maskMode == MASK420) {
-    return (ptr[x * 2] + ptr[x * 2 + 1] + ptr[x * 2 + pitch] + ptr[x * 2 + 1 + pitch]) * 0.25f;
-  }
-  else if constexpr (maskMode == MASK420_MPEG2) {
-    float left = right_value;
-    const float mid = ptr[x * 2] + ptr[x * 2 + pitch];
-    right_value = ptr[x * 2 + 1] + ptr[x * 2 + 1 + pitch];
-    return (left + 2.0f * mid + right_value) * 0.125f;
-  }
-  else if constexpr (maskMode == MASK422) {
-    return (ptr[x * 2] + ptr[x * 2 + 1]) * 0.5f;
-  }
-  else if constexpr (maskMode == MASK422_MPEG2) {
-    float left = right_value;
-    const float mid = ptr[x * 2];
-    right_value = ptr[x * 2 + 1];
-    return (left + 2.0f * mid + right_value) * 0.25f;
-  }
-}
-
-// Helper function to prepare effective mask pointer for a complete row
-// integer 8-16 bits version
-template<MaskMode maskMode, typename pixel_t>
-AVS_FORCEINLINE static const pixel_t* prepare_effective_mask_for_row(
-  const pixel_t* maskp,
-  int mask_pitch,
-  int width,
-  std::vector<pixel_t>& effective_mask_buffer
-) {
-  if constexpr (maskMode == MASK444) {
-    // Direct access to original mask - no pre-calculation needed
-    return maskp;
-  }
-  else {
-    // Initialize sliding window state for MPEG2 modes
-    int mask_right = 0; // initialized to silence warnings, actual value set below
-    if constexpr (maskMode == MASK420_MPEG2) {
-      mask_right = maskp[0] + maskp[0 + mask_pitch];
-    }
-    else if constexpr (maskMode == MASK422_MPEG2) {
-      mask_right = maskp[0];
-    }
-
-    // Pre-calculate averaged mask values
-    for (int x = 0; x < width; ++x) {
-      effective_mask_buffer[x] = (pixel_t)calculate_effective_mask<maskMode>(maskp, x, mask_pitch, mask_right);
-    }
-    return effective_mask_buffer.data();
-  }
-}
-
-// Helper function to prepare effective mask pointer for a complete row
-// float version
-template<MaskMode maskMode>
-AVS_FORCEINLINE static const float* prepare_effective_mask_for_row_f(
-  const float* maskp,
-  int mask_pitch,
-  int width,
-  std::vector<float>& effective_mask_buffer
-) {
-  if constexpr (maskMode == MASK444) {
-    // Direct access to original mask - no pre-calculation needed
-    return maskp;
-  }
-  else {
-    // Initialize sliding window state for MPEG2 modes
-    float mask_right = 0.0f; // initialized to silence warnings, actual value set below
-    if constexpr (maskMode == MASK420_MPEG2) {
-      mask_right = maskp[0] + maskp[0 + mask_pitch];
-    }
-    else if constexpr (maskMode == MASK422_MPEG2) {
-      mask_right = maskp[0];
-    }
-
-    // Pre-calculate averaged mask values
-    for (int x = 0; x < width; ++x) {
-      effective_mask_buffer[x] = calculate_effective_mask_f<maskMode>(maskp, x, mask_pitch, mask_right);
-    }
-    return effective_mask_buffer.data();
-  }
-}
 
 // YUV(A) mul 8-16 bits
 // when chroma is processed, one can use/not use source chroma,
 // Only when use_alpha: maskMode defines mask generation for chroma planes
 // When use_alpha == false maskMode ignored
-template<MaskMode maskMode, typename pixel_t, bool lessthan16bits, bool is_chroma, bool use_chroma, bool has_alpha>
-static void layer_yuv_mul_c(BYTE* dstp8, const BYTE* ovrp8, const BYTE* maskp8, int dst_pitch, int overlay_pitch, int mask_pitch, int width, int height, int level, int bits_per_pixel) {
+//
+// full_opacity == true : level >= (1<<bpp); rowprep returns spatial avg; alpha_mask = eff[x].
+// full_opacity == false: rowprep bakes (avg*level+1)>>bpp; alpha_mask = eff[x] directly.
+template<MaskMode maskMode, typename pixel_t, bool lessthan16bits, bool is_chroma, bool use_chroma, bool has_alpha, bool full_opacity>
+static void layer_yuv_mul_c_inner(BYTE* dstp8, const BYTE* ovrp8, const BYTE* maskp8, int dst_pitch, int overlay_pitch, int mask_pitch, int width, int height, int level, int bits_per_pixel) {
   pixel_t* dstp = reinterpret_cast<pixel_t*>(dstp8);
   const pixel_t* ovrp = reinterpret_cast<const pixel_t*>(ovrp8);
   const pixel_t* maskp = reinterpret_cast<const pixel_t*>(maskp8);
@@ -182,24 +54,29 @@ static void layer_yuv_mul_c(BYTE* dstp8, const BYTE* ovrp8, const BYTE* maskp8, 
   else if constexpr (sizeof(pixel_t) == 2 && !lessthan16bits)
     bits_per_pixel = 16; // make quasi constexpr
 
-  // precalculate mask buffer
+  // Buffer: needed for subsampled spatial averaging, or MASK444+!full_opacity baking.
   std::vector<pixel_t> effective_mask_buffer;
-  if constexpr (has_alpha && maskMode != MASK444) {
+  if constexpr (has_alpha && (maskMode != MASK444 || !full_opacity)) {
     effective_mask_buffer.resize(width);
   }
 
   for (int y = 0; y < height; ++y) {
     const pixel_t* effective_mask_ptr = nullptr;
 
-    // precalculate effective mask for this row
+    // Rowprep: full_opacity path returns spatial avg (or maskp for MASK444).
+    //          !full_opacity path bakes (avg * level + 1) >> bpp via LAYER_ROWPREP_LEVEL_FN.
     if constexpr (has_alpha) {
-      effective_mask_ptr = prepare_effective_mask_for_row<maskMode, pixel_t>(maskp, mask_pitch, width, effective_mask_buffer);
+      if constexpr (full_opacity)
+        effective_mask_ptr = LAYER_ROWPREP_FN<maskMode, pixel_t, true>(maskp, mask_pitch, width, effective_mask_buffer);
+      else
+        effective_mask_ptr = LAYER_ROWPREP_LEVEL_FN<maskMode, pixel_t, false>(maskp, mask_pitch, width, effective_mask_buffer, level, bits_per_pixel);
     }
 
-    // Main blending loop - now simplified and vectorizable
+    // Main blending loop — alpha_mask is fully prepared by rowprep.
     for (int x = 0; x < width; ++x) {
-      int effective_mask = has_alpha ? effective_mask_ptr[x] : 0;
-      int alpha_mask = has_alpha ? (int)(((calc_t)effective_mask * level + 1) >> bits_per_pixel) : level;
+      // has_alpha=true: rowprep baked level in (!full_opacity) or returned avg (full_opacity).
+      // has_alpha=false: flat level, no mask.
+      int alpha_mask = has_alpha ? (int)effective_mask_ptr[x] : level;
 
       // fixme: no rounding? (code from YUY2)
       // for mul: no.
@@ -222,11 +99,28 @@ static void layer_yuv_mul_c(BYTE* dstp8, const BYTE* ovrp8, const BYTE* maskp8, 
     dstp += dst_pitch;
     ovrp += overlay_pitch;
     if constexpr (has_alpha) {
-      if constexpr (maskMode == MASK420 || maskMode == MASK420_MPEG2)
+      if constexpr (maskMode == MASK420 || maskMode == MASK420_MPEG2 || maskMode == MASK420_TOPLEFT)
         maskp += mask_pitch * 2;
       else
         maskp += mask_pitch;
     }
+  }
+}
+
+// Outer dispatcher: checks level >= (1<<bpp) at runtime to select full_opacity branch.
+template<MaskMode maskMode, typename pixel_t, bool lessthan16bits, bool is_chroma, bool use_chroma, bool has_alpha>
+static void layer_yuv_mul_c(BYTE* dstp8, const BYTE* ovrp8, const BYTE* maskp8, int dst_pitch, int overlay_pitch, int mask_pitch, int width, int height, int level, int bits_per_pixel) {
+  if constexpr (!has_alpha) {
+    // No mask — full_opacity choice is irrelevant; use true to skip dead buffer allocation.
+    layer_yuv_mul_c_inner<maskMode, pixel_t, lessthan16bits, is_chroma, use_chroma, false, true>(
+      dstp8, ovrp8, maskp8, dst_pitch, overlay_pitch, mask_pitch, width, height, level, bits_per_pixel);
+  } else {
+    if (level >= (1 << bits_per_pixel))
+      layer_yuv_mul_c_inner<maskMode, pixel_t, lessthan16bits, is_chroma, use_chroma, true, true>(
+        dstp8, ovrp8, maskp8, dst_pitch, overlay_pitch, mask_pitch, width, height, level, bits_per_pixel);
+    else
+      layer_yuv_mul_c_inner<maskMode, pixel_t, lessthan16bits, is_chroma, use_chroma, true, false>(
+        dstp8, ovrp8, maskp8, dst_pitch, overlay_pitch, mask_pitch, width, height, level, bits_per_pixel);
   }
 }
 
@@ -278,7 +172,7 @@ static void layer_yuv_mul_f_c(BYTE* dstp8, const BYTE* ovrp8, const BYTE* maskp8
     dstp += dst_pitch;
     ovrp += overlay_pitch;
     if constexpr (has_alpha) {
-      if constexpr (maskMode == MASK420 || maskMode == MASK420_MPEG2)
+      if constexpr (maskMode == MASK420 || maskMode == MASK420_MPEG2 || maskMode == MASK420_TOPLEFT)
         maskp += mask_pitch * 2;
       else
         maskp += mask_pitch;
@@ -343,8 +237,11 @@ static void layer_yuv_mul_f_c(BYTE* dstp8, const BYTE* ovrp8, const BYTE* maskp8
 // The 16-wide approach's higher upfront cost is amortized by massive parallelism.
 
 // Separated mask precalculation per row.
-template<MaskMode maskMode, typename pixel_t, bool lessthan16bits, bool is_chroma, bool use_chroma, bool has_alpha, bool subtract>
-static void layer_yuv_add_subtract_c(BYTE* dstp8, const BYTE* ovrp8, const BYTE* mask8, int dst_pitch, int overlay_pitch, int mask_pitch, int width, int height, int level, int bits_per_pixel) {
+// full_opacity == true : level >= (1<<bpp); rowprep returns spatial avg; alpha_mask = eff[x].
+// full_opacity == false: rowprep bakes (avg*level+1)>>bpp; alpha_mask = eff[x] directly.
+// subtract=false only: overlay clip is pre-inverted by Layer::Create when op="Subtract".
+template<MaskMode maskMode, typename pixel_t, bool lessthan16bits, bool is_chroma, bool use_chroma, bool has_alpha, bool full_opacity>
+static void layer_yuv_add_c_inner(BYTE* dstp8, const BYTE* ovrp8, const BYTE* mask8, int dst_pitch, int overlay_pitch, int mask_pitch, int width, int height, int level, int bits_per_pixel) {
   pixel_t* dstp = reinterpret_cast<pixel_t*>(dstp8);
   const pixel_t* ovrp = reinterpret_cast<const pixel_t*>(ovrp8);
   const pixel_t* maskp = reinterpret_cast<const pixel_t*>(mask8);
@@ -359,62 +256,43 @@ static void layer_yuv_add_subtract_c(BYTE* dstp8, const BYTE* ovrp8, const BYTE*
   else if constexpr (sizeof(pixel_t) == 2 && !lessthan16bits)
     bits_per_pixel = 16; // make quasi constexpr
 
-  const int max_pixel_value = (1 << bits_per_pixel) - 1;
   const int rounder = 1 << (bits_per_pixel - 1);
 
-  // Allocate temporary mask buffer
+  // Buffer: needed for subsampled spatial averaging, or MASK444+!full_opacity baking.
   std::vector<pixel_t> effective_mask_buffer;
-  if constexpr (has_alpha && maskMode != MASK444) {
+  if constexpr (has_alpha && (maskMode != MASK444 || !full_opacity)) {
     effective_mask_buffer.resize(width);
   }
 
   for (int y = 0; y < height; ++y) {
     const pixel_t* effective_mask_ptr = nullptr;
 
-    // precalculate effective mask for this row
+    // Rowprep: full_opacity path returns spatial avg (or maskp for MASK444).
+    //          !full_opacity path bakes (avg * level + 1) >> bpp via LAYER_ROWPREP_LEVEL_FN.
     if constexpr (has_alpha) {
-      effective_mask_ptr = prepare_effective_mask_for_row<maskMode, pixel_t>(maskp, mask_pitch, width, effective_mask_buffer);
+      if constexpr (full_opacity)
+        effective_mask_ptr = LAYER_ROWPREP_FN<maskMode, pixel_t, true>(maskp, mask_pitch, width, effective_mask_buffer);
+      else
+        effective_mask_ptr = LAYER_ROWPREP_LEVEL_FN<maskMode, pixel_t, false>(maskp, mask_pitch, width, effective_mask_buffer, level, bits_per_pixel);
     }
 
-    // Main blending loop - now simplified
+    // Main blending loop — alpha_mask is fully prepared by rowprep.
     for (int x = 0; x < width; ++x) {
-      int alpha_mask;
-      if constexpr (has_alpha) {
-        int effective_mask = effective_mask_ptr[x];
-        alpha_mask = (int)(((calc_t)effective_mask * level + 1) >> bits_per_pixel);
-      }
-      else {
-        alpha_mask = level;
-      }
+      // has_alpha=true: rowprep baked level in (!full_opacity) or returned avg (full_opacity).
+      // has_alpha=false: flat level, no mask.
+      int alpha_mask = has_alpha ? (int)effective_mask_ptr[x] : level;
 
-      if constexpr (subtract) {
-        if constexpr (!is_chroma || use_chroma) {
-          if constexpr (!is_chroma)
-            dstp[x] = (pixel_t)(dstp[x] + (((calc_t)(max_pixel_value - ovrp[x] - dstp[x]) * alpha_mask + rounder) >> bits_per_pixel));
-          else
-          {
-            const int half = 1 << (bits_per_pixel - 1);
-            dstp[x] = (pixel_t)(dstp[x] + (((calc_t)(2 * half - ovrp[x] - dstp[x]) * alpha_mask + rounder) >> bits_per_pixel));
-          }
-        }
-        else {
-          const int half = 1 << (bits_per_pixel - 1);
-          dstp[x] = (pixel_t)(dstp[x] + (((calc_t)(half - dstp[x]) * alpha_mask + rounder) >> bits_per_pixel));
-        }
-      }
+      if constexpr (!is_chroma || use_chroma)
+        dstp[x] = (pixel_t)(dstp[x] + (((calc_t)(ovrp[x] - dstp[x]) * alpha_mask + rounder) >> bits_per_pixel));
       else {
-        if constexpr (!is_chroma || use_chroma)
-          dstp[x] = (pixel_t)(dstp[x] + (((calc_t)(ovrp[x] - dstp[x]) * alpha_mask + rounder) >> bits_per_pixel));
-        else {
-          const int half = 1 << (bits_per_pixel - 1);
-          dstp[x] = (pixel_t)(dstp[x] + (((calc_t)(half - dstp[x]) * alpha_mask + rounder) >> bits_per_pixel));
-        }
+        const int half = 1 << (bits_per_pixel - 1);
+        dstp[x] = (pixel_t)(dstp[x] + (((calc_t)(half - dstp[x]) * alpha_mask + rounder) >> bits_per_pixel));
       }
     }
     dstp += dst_pitch;
     ovrp += overlay_pitch;
     if constexpr (has_alpha) {
-      if constexpr (maskMode == MASK420 || maskMode == MASK420_MPEG2)
+      if constexpr (maskMode == MASK420 || maskMode == MASK420_MPEG2 || maskMode == MASK420_TOPLEFT)
         maskp += mask_pitch * 2;
       else
         maskp += mask_pitch;
@@ -422,9 +300,26 @@ static void layer_yuv_add_subtract_c(BYTE* dstp8, const BYTE* ovrp8, const BYTE*
   }
 }
 
-// YUV(A) add/subtract 32 bits
-template<MaskMode maskMode, bool is_chroma, bool use_chroma, bool has_alpha, bool subtract>
-static void layer_yuv_add_subtract_f_c(BYTE* dstp8, const BYTE* ovrp8, const BYTE* maskp8, int dst_pitch, int overlay_pitch, int mask_pitch, int width, int height, float opacity) {
+// Outer dispatcher: checks level >= (1<<bpp) at runtime to select full_opacity branch.
+template<MaskMode maskMode, typename pixel_t, bool lessthan16bits, bool is_chroma, bool use_chroma, bool has_alpha>
+static void layer_yuv_add_c(BYTE* dstp8, const BYTE* ovrp8, const BYTE* mask8, int dst_pitch, int overlay_pitch, int mask_pitch, int width, int height, int level, int bits_per_pixel) {
+  if constexpr (!has_alpha) {
+    // No mask — full_opacity choice is irrelevant; use true to skip dead buffer allocation.
+    layer_yuv_add_c_inner<maskMode, pixel_t, lessthan16bits, is_chroma, use_chroma, false, true>(
+      dstp8, ovrp8, mask8, dst_pitch, overlay_pitch, mask_pitch, width, height, level, bits_per_pixel);
+  } else {
+    if (level >= (1 << bits_per_pixel))
+      layer_yuv_add_c_inner<maskMode, pixel_t, lessthan16bits, is_chroma, use_chroma, true, true>(
+        dstp8, ovrp8, mask8, dst_pitch, overlay_pitch, mask_pitch, width, height, level, bits_per_pixel);
+    else
+      layer_yuv_add_c_inner<maskMode, pixel_t, lessthan16bits, is_chroma, use_chroma, true, false>(
+        dstp8, ovrp8, mask8, dst_pitch, overlay_pitch, mask_pitch, width, height, level, bits_per_pixel);
+  }
+}
+
+// YUV(A) add 32 bits — subtract is handled by pre-inverted overlay (Layer::Create).
+template<MaskMode maskMode, bool is_chroma, bool use_chroma, bool has_alpha>
+static void layer_yuv_add_f_c(BYTE* dstp8, const BYTE* ovrp8, const BYTE* maskp8, int dst_pitch, int overlay_pitch, int mask_pitch, int width, int height, float opacity) {
   float* dstp = reinterpret_cast<float*>(dstp8);
   const float* ovrp = reinterpret_cast<const float*>(ovrp8);
   const float* maskp = reinterpret_cast<const float*>(maskp8);
@@ -472,29 +367,18 @@ static void layer_yuv_add_subtract_f_c(BYTE* dstp8, const BYTE* ovrp8, const BYT
       float effective_mask = has_alpha ? effective_mask_ptr[x] : 0.0f;
       float alpha_mask = has_alpha ? effective_mask * opacity : opacity;
 
-      if constexpr (subtract) {
-        constexpr float ref_pixel_value = is_chroma ? 0.0f : 1.0f;
-        if constexpr (!is_chroma || use_chroma) {
-          dstp[x] = dstp[x] + (ref_pixel_value - ovrp[x] - dstp[x]) * alpha_mask;
-        }
-        else {
-          dstp[x] = dstp[x] + (ref_pixel_value - dstp[x]) * alpha_mask;
-        }
+      if constexpr (!is_chroma || use_chroma) {
+        dstp[x] = dstp[x] + (ovrp[x] - dstp[x]) * alpha_mask;
       }
       else {
-        if constexpr (!is_chroma || use_chroma) {
-          dstp[x] = dstp[x] + (ovrp[x] - dstp[x]) * alpha_mask;
-        }
-        else {
-          constexpr float half = 0.0f;
-          dstp[x] = dstp[x] + (half - dstp[x]) * alpha_mask;
-        }
+        constexpr float half = 0.0f;
+        dstp[x] = dstp[x] + (half - dstp[x]) * alpha_mask;
       }
     }
     dstp += dst_pitch;
     ovrp += overlay_pitch;
     if constexpr (has_alpha) {
-      if constexpr (maskMode == MASK420 || maskMode == MASK420_MPEG2)
+      if constexpr (maskMode == MASK420 || maskMode == MASK420_MPEG2 || maskMode == MASK420_TOPLEFT)
         maskp += mask_pitch * 2;
       else
         maskp += mask_pitch;
@@ -530,7 +414,7 @@ static void layer_yuv_lighten_darken_c(
   mask_pitch /= sizeof(pixel_t);
 
   const int cwidth = (maskMode == MASK444) ? width : (maskMode == MASK411) ? width >> 2 : width >> 1; // 444:/1  420,422:/2  411:/4
-  const int cheight = (maskMode == MASK444 || maskMode == MASK422 || maskMode == MASK422_MPEG2 || maskMode == MASK411) ? height : height >> 1; // 444,422,411:/1  420:/2
+  const int cheight = (maskMode == MASK444 || maskMode == MASK422 || maskMode == MASK422_MPEG2 || maskMode == MASK422_TOPLEFT || maskMode == MASK411) ? height : height >> 1; // 444,422,411:/1  420:/2
 
   // In lighten/darken we need 3 buffers:
   std::vector<pixel_t> ovr_buffer;
@@ -589,7 +473,7 @@ static void layer_yuv_lighten_darken_c(
       if constexpr (maskMode == MASK444)
         dstp[x] = dstp[x] + (int)(((calc_t)(ovrp[x] - dstp[x]) * alpha_mask + rounder) >> bits_per_pixel);
     }
-    if constexpr (maskMode == MASK420 || maskMode == MASK420_MPEG2) {
+    if constexpr (maskMode == MASK420 || maskMode == MASK420_MPEG2 || maskMode == MASK420_TOPLEFT) {
       dstp += dst_pitch * 2; // skip vertical subsampling
       ovrp += overlay_pitch * 2;
       if constexpr (has_alpha) {
@@ -656,7 +540,7 @@ static void layer_yuv_lighten_darken_f_c(
   mask_pitch /= sizeof(float);
 
   const int cwidth = (maskMode == MASK444) ? width : (maskMode == MASK411) ? width >> 2 : width >> 1; // 444:/1  420,422:/2  411:/4
-  const int cheight = (maskMode == MASK444 || maskMode == MASK422 || maskMode == MASK422_MPEG2 || maskMode == MASK411) ? height : height >> 1; // 444,422,411:/1  420:/2
+  const int cheight = (maskMode == MASK444 || maskMode == MASK422 || maskMode == MASK422_MPEG2 || maskMode == MASK422_TOPLEFT || maskMode == MASK411) ? height : height >> 1; // 444,422,411:/1  420:/2
 
   // In lighten/darken we need 3 buffers:
   std::vector<float> ovr_buffer;
@@ -706,7 +590,7 @@ static void layer_yuv_lighten_darken_f_c(
       if constexpr (maskMode == MASK444)
         dstp[x] = dstp[x] + (ovrp[x] - dstp[x]) * alpha_mask;
     }
-    if constexpr (maskMode == MASK420 || maskMode == MASK420_MPEG2) {
+    if constexpr (maskMode == MASK420 || maskMode == MASK420_MPEG2 || maskMode == MASK420_TOPLEFT) {
       dstp += dst_pitch * 2; // skip vertical subsampling
       ovrp += overlay_pitch * 2;
       if constexpr (has_alpha) {
@@ -771,6 +655,8 @@ static void get_layer_yuv_lighten_darken_functions(bool isLighten, int placement
     {
       if (placement == PLACEMENT_MPEG1)
         YUV_LIGHTEN_DARKEN_DISPATCH(LIGHTEN, MASK420, false, false)
+      else if (placement == PLACEMENT_TOPLEFT)
+        YUV_LIGHTEN_DARKEN_DISPATCH(LIGHTEN, MASK420_TOPLEFT, false, false)
       else
         YUV_LIGHTEN_DARKEN_DISPATCH(LIGHTEN, MASK420_MPEG2, false, false)
         // PLACEMENT_MPEG2
@@ -779,6 +665,8 @@ static void get_layer_yuv_lighten_darken_functions(bool isLighten, int placement
     {
       if (placement == PLACEMENT_MPEG1)
         YUV_LIGHTEN_DARKEN_DISPATCH(LIGHTEN, MASK422, false, false)
+      else if (placement == PLACEMENT_TOPLEFT)
+        YUV_LIGHTEN_DARKEN_DISPATCH(LIGHTEN, MASK422_TOPLEFT, false, false)
       else
         YUV_LIGHTEN_DARKEN_DISPATCH(LIGHTEN, MASK422_MPEG2, false, false)
         // PLACEMENT_MPEG2
@@ -796,6 +684,8 @@ static void get_layer_yuv_lighten_darken_functions(bool isLighten, int placement
     {
       if (placement == PLACEMENT_MPEG1)
         YUV_LIGHTEN_DARKEN_DISPATCH(DARKEN, MASK420, false, false)
+      else if (placement == PLACEMENT_TOPLEFT)
+        YUV_LIGHTEN_DARKEN_DISPATCH(DARKEN, MASK420_TOPLEFT, false, false)
       else // PLACEMENT_MPEG2
         YUV_LIGHTEN_DARKEN_DISPATCH(DARKEN, MASK420_MPEG2, false, false)
     }
@@ -803,6 +693,8 @@ static void get_layer_yuv_lighten_darken_functions(bool isLighten, int placement
     {
       if (placement == PLACEMENT_MPEG1)
         YUV_LIGHTEN_DARKEN_DISPATCH(DARKEN, MASK422, false, false)
+      else if (placement == PLACEMENT_TOPLEFT)
+        YUV_LIGHTEN_DARKEN_DISPATCH(DARKEN, MASK422_TOPLEFT, false, false)
       else // PLACEMENT_MPEG2
         YUV_LIGHTEN_DARKEN_DISPATCH(DARKEN, MASK422_MPEG2, false, false)
     }
@@ -853,6 +745,16 @@ static void get_layer_yuv_mul_functions(
           else YUV_MUL_DISPATCH(MASK420, true, false, false)
         }
       }
+      else if (placement == PLACEMENT_TOPLEFT) {
+        if (hasAlpha) {
+          if (use_chroma) YUV_MUL_DISPATCH(MASK420_TOPLEFT, true, true, true)
+          else YUV_MUL_DISPATCH(MASK420_TOPLEFT, true, false, true)
+        }
+        else {
+          if (use_chroma) YUV_MUL_DISPATCH(MASK420_TOPLEFT, true, true, false)
+          else YUV_MUL_DISPATCH(MASK420_TOPLEFT, true, false, false)
+        }
+      }
       else {
         if (hasAlpha) {
           if (use_chroma) YUV_MUL_DISPATCH(MASK420_MPEG2, true, true, true)
@@ -874,6 +776,16 @@ static void get_layer_yuv_mul_functions(
         else {
           if (use_chroma) YUV_MUL_DISPATCH(MASK422, true, true, false)
           else YUV_MUL_DISPATCH(MASK422, true, false, false)
+        }
+      }
+      else if (placement == PLACEMENT_TOPLEFT) {
+        if (hasAlpha) {
+          if (use_chroma) YUV_MUL_DISPATCH(MASK422_TOPLEFT, true, true, true)
+          else YUV_MUL_DISPATCH(MASK422_TOPLEFT, true, false, true)
+        }
+        else {
+          if (use_chroma) YUV_MUL_DISPATCH(MASK422_TOPLEFT, true, true, false)
+          else YUV_MUL_DISPATCH(MASK422_TOPLEFT, true, false, false)
         }
       }
       else {
@@ -909,22 +821,21 @@ static void get_layer_yuv_mul_functions(
 #undef YUV_MUL_DISPATCH
 }
 
-template<bool is_subtract>
-static void get_layer_yuv_add_subtract_functions(
+static void get_layer_yuv_add_functions(
   bool is_chroma, bool use_chroma, bool hasAlpha,
   int placement, VideoInfo& vi, int bits_per_pixel,
-  /*out*/layer_yuv_add_subtract_c_t** layer_fn,
-  /*out*/layer_yuv_add_subtract_f_c_t** layer_f_fn)
+  /*out*/layer_yuv_add_c_t** layer_fn,
+  /*out*/layer_yuv_add_f_c_t** layer_f_fn)
 {
 #define YUV_ADD_SUBTRACT_DISPATCH(MaskType, is_chroma, use_chroma, has_alpha) \
   { if (bits_per_pixel == 8) \
-    *layer_fn = layer_yuv_add_subtract_c<MaskType, uint8_t, true /*lessthan16bits*/, is_chroma, use_chroma, has_alpha, is_subtract>; \
+    *layer_fn = layer_yuv_add_c<MaskType, uint8_t, true /*lessthan16bits*/, is_chroma, use_chroma, has_alpha>; \
   else if (bits_per_pixel < 16) \
-    *layer_fn = layer_yuv_add_subtract_c<MaskType, uint16_t, true /*lessthan16bits*/, is_chroma, use_chroma, has_alpha, is_subtract>; \
+    *layer_fn = layer_yuv_add_c<MaskType, uint16_t, true /*lessthan16bits*/, is_chroma, use_chroma, has_alpha>; \
   else if (bits_per_pixel == 16) \
-    *layer_fn = layer_yuv_add_subtract_c<MaskType, uint16_t, false /*lessthan16bits*/, is_chroma, use_chroma, has_alpha, is_subtract>; \
+    *layer_fn = layer_yuv_add_c<MaskType, uint16_t, false /*lessthan16bits*/, is_chroma, use_chroma, has_alpha>; \
   else /* float */ \
-    *layer_f_fn = layer_yuv_add_subtract_f_c<MaskType, is_chroma, use_chroma, has_alpha, is_subtract>; \
+    *layer_f_fn = layer_yuv_add_f_c<MaskType, is_chroma, use_chroma, has_alpha>; \
   }
 
   if (is_chroma) // not luma channel
@@ -932,9 +843,9 @@ static void get_layer_yuv_add_subtract_functions(
     if (vi.IsYV411())
     {
       if (use_chroma)
-        *layer_fn = layer_yuv_add_subtract_c<MASK411, uint8_t, true /*lessthan16bits*/, true, true, false, is_subtract>;
+        *layer_fn = layer_yuv_add_c<MASK411, uint8_t, true /*lessthan16bits*/, true, true, false>;
       else
-        *layer_fn = layer_yuv_add_subtract_c<MASK411, uint8_t, true /*lessthan16bits*/, true, false, false, is_subtract>;
+        *layer_fn = layer_yuv_add_c<MASK411, uint8_t, true /*lessthan16bits*/, true, false, false>;
     }
     else if (vi.Is420())
     {
@@ -946,6 +857,16 @@ static void get_layer_yuv_add_subtract_functions(
         else {
           if (use_chroma) YUV_ADD_SUBTRACT_DISPATCH(MASK420, true, true, false)
           else YUV_ADD_SUBTRACT_DISPATCH(MASK420, true, false, false)
+        }
+      }
+      else if (placement == PLACEMENT_TOPLEFT) {
+        if (hasAlpha) {
+          if (use_chroma) YUV_ADD_SUBTRACT_DISPATCH(MASK420_TOPLEFT, true, true, true)
+          else YUV_ADD_SUBTRACT_DISPATCH(MASK420_TOPLEFT, true, false, true)
+        }
+        else {
+          if (use_chroma) YUV_ADD_SUBTRACT_DISPATCH(MASK420_TOPLEFT, true, true, false)
+          else YUV_ADD_SUBTRACT_DISPATCH(MASK420_TOPLEFT, true, false, false)
         }
       }
       else {
@@ -969,6 +890,16 @@ static void get_layer_yuv_add_subtract_functions(
         else {
           if (use_chroma) YUV_ADD_SUBTRACT_DISPATCH(MASK422, true, true, false)
           else YUV_ADD_SUBTRACT_DISPATCH(MASK422, true, false, false)
+        }
+      }
+      else if (placement == PLACEMENT_TOPLEFT) {
+        if (hasAlpha) {
+          if (use_chroma) YUV_ADD_SUBTRACT_DISPATCH(MASK422_TOPLEFT, true, true, true)
+          else YUV_ADD_SUBTRACT_DISPATCH(MASK422_TOPLEFT, true, false, true)
+        }
+        else {
+          if (use_chroma) YUV_ADD_SUBTRACT_DISPATCH(MASK422_TOPLEFT, true, true, false)
+          else YUV_ADD_SUBTRACT_DISPATCH(MASK422_TOPLEFT, true, false, false)
         }
       }
       else {
@@ -1006,19 +937,29 @@ static void get_layer_yuv_add_subtract_functions(
 
 /* planar rgb */
 
-template<int mode, typename pixel_t, bool lessthan16bits, bool has_alpha>
-static void layer_planarrgb_lighten_darken_c(BYTE** dstp8, const BYTE** ovrp8, int dst_pitch, int overlay_pitch, int width, int height, int level, int thresh, int bits_per_pixel) {
+template<int mode, typename pixel_t, bool lessthan16bits, bool has_alpha, bool blend_alpha>
+static void layer_planarrgb_lighten_darken_c(BYTE** dstp8, const BYTE** ovrp8, const BYTE* maskp8, int dst_pitch, int overlay_pitch, int mask_pitch, int width, int height, int level, int thresh, int bits_per_pixel) {
   pixel_t* dstp_g = reinterpret_cast<pixel_t*>(dstp8[0]);
   pixel_t* dstp_b = reinterpret_cast<pixel_t*>(dstp8[1]);
   pixel_t* dstp_r = reinterpret_cast<pixel_t*>(dstp8[2]);
-  pixel_t* dstp_a = reinterpret_cast<pixel_t*>(dstp8[3]);
+  // dstp8[3]: written only when blend_alpha=true (both clips have alpha).
+  pixel_t* dstp_a;
+  if constexpr (blend_alpha)
+    dstp_a = reinterpret_cast<pixel_t*>(dstp8[3]);
   const pixel_t* ovrp_g = reinterpret_cast<const pixel_t*>(ovrp8[0]);
   const pixel_t* ovrp_b = reinterpret_cast<const pixel_t*>(ovrp8[1]);
   const pixel_t* ovrp_r = reinterpret_cast<const pixel_t*>(ovrp8[2]);
-  const pixel_t* maskp = reinterpret_cast<const pixel_t*>(ovrp8[3]);
+  // maskp: per-pixel blend weight — decoupled from ovrp8[3] so a future mask clip can be wired in.
+  const pixel_t* maskp = reinterpret_cast<const pixel_t*>(maskp8);
+  // alpha_target: value blended into dstp_a (only used when blend_alpha=true).
+  // For plain Add this is the same plane as maskp; for Subtract it is the inverted A plane.
+  const pixel_t* alpha_target;
+  if constexpr (blend_alpha)
+    alpha_target = reinterpret_cast<const pixel_t*>(ovrp8[3]);
 
   dst_pitch /= sizeof(pixel_t);
   overlay_pitch /= sizeof(pixel_t);
+  mask_pitch /= sizeof(pixel_t);
 
   using calc_t = typename std::conditional < lessthan16bits, int, int64_t>::type; // for non-overflowing 16 bit alpha_mul
   if constexpr (sizeof(pixel_t) == 1)
@@ -1043,35 +984,46 @@ static void layer_planarrgb_lighten_darken_c(BYTE** dstp8, const BYTE** ovrp8, i
       dstp_r[x] = (pixel_t)(dstp_r[x] + (((ovrp_r[x] - dstp_r[x]) * alpha + rounder) >> bits_per_pixel));
       dstp_g[x] = (pixel_t)(dstp_g[x] + (((ovrp_g[x] - dstp_g[x]) * alpha + rounder) >> bits_per_pixel));
       dstp_b[x] = (pixel_t)(dstp_b[x] + (((ovrp_b[x] - dstp_b[x]) * alpha + rounder) >> bits_per_pixel));
-      if constexpr (has_alpha)
-        dstp_a[x] = (pixel_t)(dstp_a[x] + (((maskp[x] - dstp_a[x]) * alpha + rounder) >> bits_per_pixel));
+      // alpha channel: same Add formula; alpha_target may differ from maskp (Subtract case).
+      if constexpr (blend_alpha)
+        dstp_a[x] = (pixel_t)(dstp_a[x] + (((alpha_target[x] - dstp_a[x]) * alpha + rounder) >> bits_per_pixel));
     }
     dstp_g += dst_pitch;
     dstp_b += dst_pitch;
     dstp_r += dst_pitch;
-    if constexpr (has_alpha)
+    if constexpr (blend_alpha)
       dstp_a += dst_pitch;
     ovrp_g += overlay_pitch;
     ovrp_b += overlay_pitch;
     ovrp_r += overlay_pitch;
     if constexpr (has_alpha)
-      maskp += overlay_pitch;
+      maskp += mask_pitch;
+    if constexpr (blend_alpha)
+      alpha_target += overlay_pitch;
   }
 }
 
-template<int mode, bool has_alpha>
-static void layer_planarrgb_lighten_darken_f_c(BYTE** dstp8, const BYTE** ovrp8, int dst_pitch, int overlay_pitch, int width, int height, float opacity, float thresh) {
+template<int mode, bool has_alpha, bool blend_alpha>
+static void layer_planarrgb_lighten_darken_f_c(BYTE** dstp8, const BYTE** ovrp8, const BYTE* maskp8, int dst_pitch, int overlay_pitch, int mask_pitch, int width, int height, float opacity, float thresh) {
   float* dstp_g = reinterpret_cast<float*>(dstp8[0]);
   float* dstp_b = reinterpret_cast<float*>(dstp8[1]);
   float* dstp_r = reinterpret_cast<float*>(dstp8[2]);
-  float* dstp_a = reinterpret_cast<float*>(dstp8[3]);
+  // dstp8[3]: written only when blend_alpha=true (both clips have alpha).
+  float* dstp_a;
+  if constexpr (blend_alpha)
+    dstp_a = reinterpret_cast<float*>(dstp8[3]);
   const float* ovrp_g = reinterpret_cast<const float*>(ovrp8[0]);
   const float* ovrp_b = reinterpret_cast<const float*>(ovrp8[1]);
   const float* ovrp_r = reinterpret_cast<const float*>(ovrp8[2]);
-  const float* maskp = reinterpret_cast<const float*>(ovrp8[3]);
+  // maskp: per-pixel blend weight — decoupled from ovrp8[3].
+  const float* maskp = reinterpret_cast<const float*>(maskp8);
+  const float* alpha_target;
+  if constexpr (blend_alpha)
+    alpha_target = reinterpret_cast<const float*>(ovrp8[3]);
 
   dst_pitch /= sizeof(float);
   overlay_pitch /= sizeof(float);
+  mask_pitch /= sizeof(float);
 
   for (int y = 0; y < height; ++y) {
     for (int x = 0; x < width; ++x) {
@@ -1088,68 +1040,84 @@ static void layer_planarrgb_lighten_darken_f_c(BYTE** dstp8, const BYTE** ovrp8,
       dstp_r[x] = dstp_r[x] + (ovrp_r[x] - dstp_r[x]) * alpha;
       dstp_g[x] = dstp_g[x] + (ovrp_g[x] - dstp_g[x]) * alpha;
       dstp_b[x] = dstp_b[x] + (ovrp_b[x] - dstp_b[x]) * alpha;
-      if constexpr (has_alpha)
-        dstp_a[x] = dstp_a[x] + (maskp[x] - dstp_a[x]) * alpha;
+      if constexpr (blend_alpha)
+        dstp_a[x] = dstp_a[x] + (alpha_target[x] - dstp_a[x]) * alpha;
     }
     dstp_g += dst_pitch;
     dstp_b += dst_pitch;
     dstp_r += dst_pitch;
-    if constexpr (has_alpha)
+    if constexpr (blend_alpha)
       dstp_a += dst_pitch;
     ovrp_g += overlay_pitch;
     ovrp_b += overlay_pitch;
     ovrp_r += overlay_pitch;
     if constexpr (has_alpha)
-      maskp += overlay_pitch;
+      maskp += mask_pitch;
+    if constexpr (blend_alpha)
+      alpha_target += overlay_pitch;
   }
 }
 
 
-static void get_layer_planarrgb_lighten_darken_functions(bool isLighten, bool hasAlpha, int bits_per_pixel, /*out*/layer_planarrgb_lighten_darken_c_t** layer_fn, /*out*/layer_planarrgb_lighten_darken_f_c_t** layer_f_fn) {
+static void get_layer_planarrgb_lighten_darken_functions(bool isLighten, bool hasAlpha, bool blendAlpha, int bits_per_pixel, /*out*/layer_planarrgb_lighten_darken_c_t** layer_fn, /*out*/layer_planarrgb_lighten_darken_f_c_t** layer_f_fn) {
 
-#define PLANARRGB_LD_DISPATCH(LorD, has_alpha) \
+#define PLANARRGB_LD_DISPATCH(LorD, has_alpha, blend_alpha) \
       { if (bits_per_pixel == 8) \
-        *layer_fn = layer_planarrgb_lighten_darken_c<LorD, uint8_t, true /*lessthan16bits*/, has_alpha>; \
+        *layer_fn = layer_planarrgb_lighten_darken_c<LorD, uint8_t, true /*lessthan16bits*/, has_alpha, blend_alpha>; \
       else if (bits_per_pixel < 16) \
-        *layer_fn = layer_planarrgb_lighten_darken_c<LorD, uint16_t, true /*lessthan16bits*/, has_alpha>; \
+        *layer_fn = layer_planarrgb_lighten_darken_c<LorD, uint16_t, true /*lessthan16bits*/, has_alpha, blend_alpha>; \
       else if (bits_per_pixel == 16) \
-        *layer_fn = layer_planarrgb_lighten_darken_c<LorD, uint16_t, false /*lessthan16bits*/, has_alpha>; \
+        *layer_fn = layer_planarrgb_lighten_darken_c<LorD, uint16_t, false /*lessthan16bits*/, has_alpha, blend_alpha>; \
       else /* float */ \
-        *layer_f_fn = layer_planarrgb_lighten_darken_f_c<LorD, has_alpha>; \
+        *layer_f_fn = layer_planarrgb_lighten_darken_f_c<LorD, has_alpha, blend_alpha>; \
       }
 
   if (isLighten) {
     if (hasAlpha) {
-      PLANARRGB_LD_DISPATCH(LIGHTEN, true)
+      if (blendAlpha) { PLANARRGB_LD_DISPATCH(LIGHTEN, true, true)  }
+      else            { PLANARRGB_LD_DISPATCH(LIGHTEN, true, false) }
     }
     else {
-      PLANARRGB_LD_DISPATCH(LIGHTEN, false)
+      PLANARRGB_LD_DISPATCH(LIGHTEN, false, false)
     }
   } // lighten end
   else {
     if (hasAlpha) {
-      PLANARRGB_LD_DISPATCH(DARKEN, true)
+      if (blendAlpha) { PLANARRGB_LD_DISPATCH(DARKEN, true, true)  }
+      else            { PLANARRGB_LD_DISPATCH(DARKEN, true, false) }
     }
     else {
-      PLANARRGB_LD_DISPATCH(DARKEN, false)
+      PLANARRGB_LD_DISPATCH(DARKEN, false, false)
     }
   }
 #undef PLANARRGB_LD_DISPATCH
 }
 
-template<typename pixel_t, bool lessthan16bits, bool chroma, bool has_alpha, bool subtract>
-static void layer_planarrgb_add_subtract_c(BYTE** dstp8, const BYTE** ovrp8, int dst_pitch, int overlay_pitch, int width, int height, int level, int bits_per_pixel) {
+// subtract=false only: overlay clip is pre-inverted by Layer::Create when op="Subtract".
+template<typename pixel_t, bool lessthan16bits, bool chroma, bool has_alpha, bool blend_alpha>
+static void layer_planarrgb_add_c(BYTE** dstp8, const BYTE** ovrp8, const BYTE* maskp8, int dst_pitch, int overlay_pitch, int mask_pitch, int width, int height, int level, int bits_per_pixel) {
   pixel_t* dstp_g = reinterpret_cast<pixel_t*>(dstp8[0]);
   pixel_t* dstp_b = reinterpret_cast<pixel_t*>(dstp8[1]);
   pixel_t* dstp_r = reinterpret_cast<pixel_t*>(dstp8[2]);
-  pixel_t* dstp_a = reinterpret_cast<pixel_t*>(dstp8[3]);
+  // dstp8[3]: written only when blend_alpha=true (both clips have alpha).
+  pixel_t* dstp_a;
+  if constexpr (blend_alpha)
+    dstp_a = reinterpret_cast<pixel_t*>(dstp8[3]);
   const pixel_t* ovrp_g = reinterpret_cast<const pixel_t*>(ovrp8[0]);
   const pixel_t* ovrp_b = reinterpret_cast<const pixel_t*>(ovrp8[1]);
   const pixel_t* ovrp_r = reinterpret_cast<const pixel_t*>(ovrp8[2]);
-  const pixel_t* maskp = reinterpret_cast<const pixel_t*>(ovrp8[3]);
+  // maskp: per-pixel blend weight — decoupled from ovrp8[3] to support future mask clip param.
+  const pixel_t* maskp = reinterpret_cast<const pixel_t*>(maskp8);
+  // alpha_target: the value blended into dstp_a.
+  // For plain Add: same as maskp (original overlay A).
+  // For Subtract: ovrp8[3] is the inverted A; maskp is the saved pre-invert A.
+  const pixel_t* alpha_target;
+  if constexpr (blend_alpha)
+    alpha_target = reinterpret_cast<const pixel_t*>(ovrp8[3]);
 
   dst_pitch /= sizeof(pixel_t);
   overlay_pitch /= sizeof(pixel_t);
+  mask_pitch /= sizeof(pixel_t);
 
   using calc_t = typename std::conditional < lessthan16bits, int, int64_t>::type; // for non-overflowing 16 bit alpha_mul
   if constexpr (sizeof(pixel_t) == 1)
@@ -1157,184 +1125,157 @@ static void layer_planarrgb_add_subtract_c(BYTE** dstp8, const BYTE** ovrp8, int
   else if constexpr (sizeof(pixel_t) == 2 && !lessthan16bits)
     bits_per_pixel = 16; // make quasi constexpr
 
-  const int max_pixel_value = (1 << bits_per_pixel) - 1;
-
   const int rounder = 1 << (bits_per_pixel - 1);
 
   for (int y = 0; y < height; ++y) {
     for (int x = 0; x < width; ++x) {
       calc_t alpha = has_alpha ? ((calc_t)maskp[x] * level + 1) >> bits_per_pixel : level;
-      if constexpr (subtract) {
-        // subtract
-        if constexpr (chroma) {
-          dstp_r[x] = (pixel_t)(dstp_r[x] + (((max_pixel_value - ovrp_r[x] - dstp_r[x]) * alpha + rounder) >> bits_per_pixel));
-          dstp_g[x] = (pixel_t)(dstp_g[x] + (((max_pixel_value - ovrp_g[x] - dstp_g[x]) * alpha + rounder) >> bits_per_pixel));
-          dstp_b[x] = (pixel_t)(dstp_b[x] + (((max_pixel_value - ovrp_b[x] - dstp_b[x]) * alpha + rounder) >> bits_per_pixel));
-          if constexpr (has_alpha) // fixme: to be decided. YUV does not update target alpha, rgb32 does
-            dstp_a[x] = (pixel_t)(dstp_a[x] + (((max_pixel_value - maskp[x] - dstp_a[x]) * alpha + rounder) >> bits_per_pixel));
-        }
-        else { // use luma instead of overlay
-          calc_t luma = (cyb * (max_pixel_value - ovrp_b[x]) + cyg * (max_pixel_value - ovrp_g[x]) + cyr * (max_pixel_value - ovrp_r[x])) >> 15; // no rounding not really needed here
-
-          dstp_r[x] = (pixel_t)(dstp_r[x] + (((luma - dstp_r[x]) * alpha + rounder) >> bits_per_pixel));
-          dstp_g[x] = (pixel_t)(dstp_g[x] + (((luma - dstp_g[x]) * alpha + rounder) >> bits_per_pixel));
-          dstp_b[x] = (pixel_t)(dstp_b[x] + (((luma - dstp_b[x]) * alpha + rounder) >> bits_per_pixel));
-          if constexpr (has_alpha)
-            dstp_a[x] = (pixel_t)(dstp_a[x] + (((luma - dstp_a[x]) * alpha + rounder) >> bits_per_pixel));
-        }
+      if constexpr (chroma) {
+        dstp_r[x] = (pixel_t)(dstp_r[x] + (((ovrp_r[x] - dstp_r[x]) * alpha + rounder) >> bits_per_pixel));
+        dstp_g[x] = (pixel_t)(dstp_g[x] + (((ovrp_g[x] - dstp_g[x]) * alpha + rounder) >> bits_per_pixel));
+        dstp_b[x] = (pixel_t)(dstp_b[x] + (((ovrp_b[x] - dstp_b[x]) * alpha + rounder) >> bits_per_pixel));
       }
-      else {
-        // add
-        if constexpr (chroma) {
-          dstp_r[x] = (pixel_t)(dstp_r[x] + (((ovrp_r[x] - dstp_r[x]) * alpha + rounder) >> bits_per_pixel));
-          dstp_g[x] = (pixel_t)(dstp_g[x] + (((ovrp_g[x] - dstp_g[x]) * alpha + rounder) >> bits_per_pixel));
-          dstp_b[x] = (pixel_t)(dstp_b[x] + (((ovrp_b[x] - dstp_b[x]) * alpha + rounder) >> bits_per_pixel));
-          if constexpr (has_alpha)
-            dstp_a[x] = (pixel_t)(dstp_a[x] + (((maskp[x] - dstp_a[x]) * alpha + rounder) >> bits_per_pixel));
-        }
-        else { // use luma instead of overlay
-          calc_t luma = (cyb * ovrp_b[x] + cyg * ovrp_g[x] + cyr * ovrp_r[x]) >> 15; // no rounding not really needed here
+      else { // use luma instead of overlay
+        calc_t luma = (cyb * ovrp_b[x] + cyg * ovrp_g[x] + cyr * ovrp_r[x]) >> 15; // no rounding not really needed here
 
-          dstp_r[x] = (pixel_t)(dstp_r[x] + (((luma - dstp_r[x]) * alpha + rounder) >> bits_per_pixel));
-          dstp_g[x] = (pixel_t)(dstp_g[x] + (((luma - dstp_g[x]) * alpha + rounder) >> bits_per_pixel));
-          dstp_b[x] = (pixel_t)(dstp_b[x] + (((luma - dstp_b[x]) * alpha + rounder) >> bits_per_pixel));
-          if constexpr (has_alpha)
-            dstp_a[x] = (pixel_t)(dstp_a[x] + (((luma - dstp_a[x]) * alpha + rounder) >> bits_per_pixel));
-        }
+        dstp_r[x] = (pixel_t)(dstp_r[x] + (((luma - dstp_r[x]) * alpha + rounder) >> bits_per_pixel));
+        dstp_g[x] = (pixel_t)(dstp_g[x] + (((luma - dstp_g[x]) * alpha + rounder) >> bits_per_pixel));
+        dstp_b[x] = (pixel_t)(dstp_b[x] + (((luma - dstp_b[x]) * alpha + rounder) >> bits_per_pixel));
       }
+      // alpha channel: Add formula; alpha_target may differ from maskp (Subtract case).
+      if constexpr (blend_alpha)
+        dstp_a[x] = (pixel_t)(dstp_a[x] + (((alpha_target[x] - dstp_a[x]) * alpha + rounder) >> bits_per_pixel));
     }
     dstp_g += dst_pitch;
     dstp_b += dst_pitch;
     dstp_r += dst_pitch;
-    if constexpr (has_alpha)
+    if constexpr (blend_alpha)
       dstp_a += dst_pitch;
     ovrp_g += overlay_pitch;
     ovrp_b += overlay_pitch;
     ovrp_r += overlay_pitch;
     if constexpr (has_alpha)
-      maskp += overlay_pitch;
+      maskp += mask_pitch;
+    if constexpr (blend_alpha)
+      alpha_target += overlay_pitch;
   }
 }
 
-template<bool chroma, bool has_alpha, bool subtract>
-static void layer_planarrgb_add_subtract_f_c(BYTE** dstp8, const BYTE** ovrp8, int dst_pitch, int overlay_pitch, int width, int height, float opacity) {
+// subtract=false only: overlay clip is pre-inverted by Layer::Create when op="Subtract".
+template<bool chroma, bool has_alpha, bool blend_alpha>
+static void layer_planarrgb_add_f_c(BYTE** dstp8, const BYTE** ovrp8, const BYTE* maskp8, int dst_pitch, int overlay_pitch, int mask_pitch, int width, int height, float opacity) {
   float* dstp_g = reinterpret_cast<float*>(dstp8[0]);
   float* dstp_b = reinterpret_cast<float*>(dstp8[1]);
   float* dstp_r = reinterpret_cast<float*>(dstp8[2]);
-  float* dstp_a = reinterpret_cast<float*>(dstp8[3]);
+  // dstp8[3]: written only when blend_alpha=true (both clips have alpha).
+  float* dstp_a;
+  if constexpr (blend_alpha)
+    dstp_a = reinterpret_cast<float*>(dstp8[3]);
   const float* ovrp_g = reinterpret_cast<const float*>(ovrp8[0]);
   const float* ovrp_b = reinterpret_cast<const float*>(ovrp8[1]);
   const float* ovrp_r = reinterpret_cast<const float*>(ovrp8[2]);
-  const float* maskp = reinterpret_cast<const float*>(ovrp8[3]);
+  // maskp: per-pixel blend weight — decoupled from ovrp8[3].
+  const float* maskp = reinterpret_cast<const float*>(maskp8);
+  const float* alpha_target;
+  if constexpr (blend_alpha)
+    alpha_target = reinterpret_cast<const float*>(ovrp8[3]);
 
   dst_pitch /= sizeof(float);
   overlay_pitch /= sizeof(float);
+  mask_pitch /= sizeof(float);
 
   for (int y = 0; y < height; ++y) {
     for (int x = 0; x < width; ++x) {
       float alpha = has_alpha ? maskp[x] * opacity : opacity;
 
-      if constexpr (subtract) {
-        // subtract
-        if constexpr (chroma) {
-          dstp_r[x] = dstp_r[x] + (1.0f - ovrp_r[x] - dstp_r[x]) * alpha;
-          dstp_g[x] = dstp_g[x] + (1.0f - ovrp_g[x] - dstp_g[x]) * alpha;
-          dstp_b[x] = dstp_b[x] + (1.0f - ovrp_b[x] - dstp_b[x]) * alpha;
-          if constexpr (has_alpha)
-            dstp_a[x] = dstp_a[x] + (1.0f - maskp[x] - dstp_a[x]) * alpha;
-        }
-        else { // use luma instead of overlay
-          float luma = cyb_f * (1.0f - ovrp_b[x]) + cyg_f * (1.0f - ovrp_g[x]) + cyr_f * (1.0f - ovrp_r[x]);
-          dstp_r[x] = dstp_r[x] + (luma - dstp_r[x]) * alpha;
-          dstp_g[x] = dstp_g[x] + (luma - dstp_g[x]) * alpha;
-          dstp_b[x] = dstp_b[x] + (luma - dstp_b[x]) * alpha;
-          if constexpr (has_alpha)
-            dstp_a[x] = dstp_a[x] + (luma * dstp_a[x] - dstp_a[x]) * alpha;
-        }
+      if constexpr (chroma) {
+        dstp_r[x] = dstp_r[x] + (ovrp_r[x] - dstp_r[x]) * alpha;
+        dstp_g[x] = dstp_g[x] + (ovrp_g[x] - dstp_g[x]) * alpha;
+        dstp_b[x] = dstp_b[x] + (ovrp_b[x] - dstp_b[x]) * alpha;
       }
-      else {
-        // add
-        if constexpr (chroma) {
-          dstp_r[x] = dstp_r[x] + (ovrp_r[x] - dstp_r[x]) * alpha;
-          dstp_g[x] = dstp_g[x] + (ovrp_g[x] - dstp_g[x]) * alpha;
-          dstp_b[x] = dstp_b[x] + (ovrp_b[x] - dstp_b[x]) * alpha;
-          if constexpr (has_alpha)
-            dstp_a[x] = dstp_a[x] + (maskp[x] - dstp_a[x]) * alpha;
-        }
-        else { // use luma instead of overlay
-          float luma = cyb_f * ovrp_b[x] + cyg_f * ovrp_g[x] + cyr_f * ovrp_r[x];
-          dstp_r[x] = dstp_r[x] + (luma - dstp_r[x]) * alpha;
-          dstp_g[x] = dstp_g[x] + (luma - dstp_g[x]) * alpha;
-          dstp_b[x] = dstp_b[x] + (luma - dstp_b[x]) * alpha;
-          if constexpr (has_alpha)
-            dstp_a[x] = dstp_a[x] + (luma * dstp_a[x] - dstp_a[x]) * alpha;
-        }
+      else { // use luma instead of overlay
+        float luma = cyb_f * ovrp_b[x] + cyg_f * ovrp_g[x] + cyr_f * ovrp_r[x];
+        dstp_r[x] = dstp_r[x] + (luma - dstp_r[x]) * alpha;
+        dstp_g[x] = dstp_g[x] + (luma - dstp_g[x]) * alpha;
+        dstp_b[x] = dstp_b[x] + (luma - dstp_b[x]) * alpha;
       }
+      if constexpr (blend_alpha)
+        dstp_a[x] = dstp_a[x] + (alpha_target[x] - dstp_a[x]) * alpha;
     }
     dstp_g += dst_pitch;
     dstp_b += dst_pitch;
     dstp_r += dst_pitch;
-    if constexpr (has_alpha)
+    if constexpr (blend_alpha)
       dstp_a += dst_pitch;
     ovrp_g += overlay_pitch;
     ovrp_b += overlay_pitch;
     ovrp_r += overlay_pitch;
     if constexpr (has_alpha)
-      maskp += overlay_pitch;
+      maskp += mask_pitch;
+    if constexpr (blend_alpha)
+      alpha_target += overlay_pitch;
   }
 }
 
-template<bool is_subtract>
-static void get_layer_planarrgb_add_subtract_functions(
-  bool chroma, bool hasAlpha, int bits_per_pixel,
-  /*out*/layer_planarrgb_add_subtract_c_t** layer_fn,
-  /*out*/layer_planarrgb_add_subtract_f_c_t** layer_f_fn)
+static void get_layer_planarrgb_add_functions(
+  bool chroma, bool hasAlpha, bool blendAlpha, int bits_per_pixel,
+  /*out*/layer_planarrgb_add_c_t** layer_fn,
+  /*out*/layer_planarrgb_add_f_c_t** layer_f_fn)
 {
-#define PLANARRGB_ADD_SUBTRACT_DISPATCH(chroma, has_alpha) \
+#define PLANARRGB_ADD_DISPATCH(chroma, has_alpha, blend_alpha) \
   { if (bits_per_pixel == 8) \
-    *layer_fn = layer_planarrgb_add_subtract_c<uint8_t, true /*lessthan16bits*/, chroma, has_alpha, is_subtract>; \
+    *layer_fn = layer_planarrgb_add_c<uint8_t, true /*lessthan16bits*/, chroma, has_alpha, blend_alpha>; \
   else if (bits_per_pixel < 16) \
-    *layer_fn = layer_planarrgb_add_subtract_c<uint16_t, true /*lessthan16bits*/, chroma, has_alpha, is_subtract>; \
+    *layer_fn = layer_planarrgb_add_c<uint16_t, true /*lessthan16bits*/, chroma, has_alpha, blend_alpha>; \
   else if (bits_per_pixel == 16) \
-    *layer_fn = layer_planarrgb_add_subtract_c<uint16_t, false /*lessthan16bits*/, chroma, has_alpha, is_subtract>; \
+    *layer_fn = layer_planarrgb_add_c<uint16_t, false /*lessthan16bits*/, chroma, has_alpha, blend_alpha>; \
   else /* float */ \
-    *layer_f_fn = layer_planarrgb_add_subtract_f_c<chroma, has_alpha, is_subtract>; \
+    *layer_f_fn = layer_planarrgb_add_f_c<chroma, has_alpha, blend_alpha>; \
   }
 
   if (hasAlpha) {
-    // planar RGBA
     if (chroma) {
-      PLANARRGB_ADD_SUBTRACT_DISPATCH(true, true)
+      if (blendAlpha) { PLANARRGB_ADD_DISPATCH(true, true, true)  }
+      else            { PLANARRGB_ADD_DISPATCH(true, true, false) }
     }
     else {
-      PLANARRGB_ADD_SUBTRACT_DISPATCH(false, true)
+      if (blendAlpha) { PLANARRGB_ADD_DISPATCH(false, true, true)  }
+      else            { PLANARRGB_ADD_DISPATCH(false, true, false) }
     }
   }
   else {
-    // planar RGB
     if (chroma) {
-      PLANARRGB_ADD_SUBTRACT_DISPATCH(true, false)
+      PLANARRGB_ADD_DISPATCH(true, false, false)
     }
     else {
-      PLANARRGB_ADD_SUBTRACT_DISPATCH(false, false)
+      PLANARRGB_ADD_DISPATCH(false, false, false)
     }
   }
-#undef PLANARRGB_ADD_SUBTRACT_DISPATCH
+#undef PLANARRGB_ADD_DISPATCH
 }
 
-template<typename pixel_t, bool lessthan16bits, bool chroma, bool has_alpha>
-static void layer_planarrgb_mul_c(BYTE** dstp8, const BYTE** ovrp8, int dst_pitch, int overlay_pitch, int width, int height, int level, int bits_per_pixel) {
+template<typename pixel_t, bool lessthan16bits, bool chroma, bool has_alpha, bool blend_alpha>
+static void layer_planarrgb_mul_c(BYTE** dstp8, const BYTE** ovrp8, const BYTE* maskp8, int dst_pitch, int overlay_pitch, int mask_pitch, int width, int height, int level, int bits_per_pixel) {
   pixel_t* dstp_g = reinterpret_cast<pixel_t*>(dstp8[0]);
   pixel_t* dstp_b = reinterpret_cast<pixel_t*>(dstp8[1]);
   pixel_t* dstp_r = reinterpret_cast<pixel_t*>(dstp8[2]);
-  pixel_t* dstp_a = reinterpret_cast<pixel_t*>(dstp8[3]);
+  // dstp8[3]: written only when blend_alpha=true (both clips have alpha).
+  pixel_t* dstp_a;
+  if constexpr (blend_alpha)
+    dstp_a = reinterpret_cast<pixel_t*>(dstp8[3]);
   const pixel_t* ovrp_g = reinterpret_cast<const pixel_t*>(ovrp8[0]);
   const pixel_t* ovrp_b = reinterpret_cast<const pixel_t*>(ovrp8[1]);
   const pixel_t* ovrp_r = reinterpret_cast<const pixel_t*>(ovrp8[2]);
-  const pixel_t* maskp = reinterpret_cast<const pixel_t*>(ovrp8[3]);
+  // maskp: per-pixel blend weight — decoupled from ovrp8[3].
+  const pixel_t* maskp = reinterpret_cast<const pixel_t*>(maskp8);
+  // alpha_target: the value multiplied into dstp_a (only when blend_alpha=true).
+  const pixel_t* alpha_target;
+  if constexpr (blend_alpha)
+    alpha_target = reinterpret_cast<const pixel_t*>(ovrp8[3]);
 
   dst_pitch /= sizeof(pixel_t);
   overlay_pitch /= sizeof(pixel_t);
+  mask_pitch /= sizeof(pixel_t);
 
   using calc_t = typename std::conditional < lessthan16bits, int, int64_t>::type;
   if constexpr (sizeof(pixel_t) == 1)
@@ -1350,8 +1291,6 @@ static void layer_planarrgb_mul_c(BYTE** dstp8, const BYTE** ovrp8, int dst_pitc
         dstp_r[x] = (pixel_t)(dstp_r[x] + ((((((calc_t)ovrp_r[x] * dstp_r[x]) >> bits_per_pixel) - dstp_r[x]) * alpha) >> bits_per_pixel));
         dstp_g[x] = (pixel_t)(dstp_g[x] + ((((((calc_t)ovrp_g[x] * dstp_g[x]) >> bits_per_pixel) - dstp_g[x]) * alpha) >> bits_per_pixel));
         dstp_b[x] = (pixel_t)(dstp_b[x] + ((((((calc_t)ovrp_b[x] * dstp_b[x]) >> bits_per_pixel) - dstp_b[x]) * alpha) >> bits_per_pixel));
-        if constexpr (has_alpha)
-          dstp_a[x] = (pixel_t)(dstp_a[x] + ((((((calc_t)maskp[x] * dstp_a[x]) >> bits_per_pixel) - dstp_a[x]) * alpha) >> bits_per_pixel));
       }
       else { // use luma instead of overlay
         calc_t luma = (cyb * ovrp_b[x] + cyg * ovrp_g[x] + cyr * ovrp_r[x]) >> 15; // no rounding not really needed here
@@ -1359,36 +1298,47 @@ static void layer_planarrgb_mul_c(BYTE** dstp8, const BYTE** ovrp8, int dst_pitc
         dstp_r[x] = (pixel_t)(dstp_r[x] + (((((luma * dstp_r[x]) >> bits_per_pixel) - dstp_r[x]) * alpha) >> bits_per_pixel));
         dstp_g[x] = (pixel_t)(dstp_g[x] + (((((luma * dstp_g[x]) >> bits_per_pixel) - dstp_g[x]) * alpha) >> bits_per_pixel));
         dstp_b[x] = (pixel_t)(dstp_b[x] + (((((luma * dstp_b[x]) >> bits_per_pixel) - dstp_b[x]) * alpha) >> bits_per_pixel));
-        if constexpr (has_alpha)
-          dstp_a[x] = (pixel_t)(dstp_a[x] + (((((luma * dstp_a[x]) >> bits_per_pixel) - dstp_a[x]) * alpha) >> bits_per_pixel));
       }
+      // alpha channel: Mul formula; alpha_target provides the ovr_A value.
+      if constexpr (blend_alpha)
+        dstp_a[x] = (pixel_t)(dstp_a[x] + ((((((calc_t)alpha_target[x] * dstp_a[x]) >> bits_per_pixel) - dstp_a[x]) * alpha) >> bits_per_pixel));
     }
     dstp_g += dst_pitch;
     dstp_b += dst_pitch;
     dstp_r += dst_pitch;
-    if constexpr (has_alpha)
+    if constexpr (blend_alpha)
       dstp_a += dst_pitch;
     ovrp_g += overlay_pitch;
     ovrp_b += overlay_pitch;
     ovrp_r += overlay_pitch;
     if constexpr (has_alpha)
-      maskp += overlay_pitch;
+      maskp += mask_pitch;
+    if constexpr (blend_alpha)
+      alpha_target += overlay_pitch;
   }
 }
 
-template<bool chroma, bool has_alpha>
-static void layer_planarrgb_mul_f_c(BYTE** dstp8, const BYTE** ovrp8, int dst_pitch, int overlay_pitch, int width, int height, float opacity) {
+template<bool chroma, bool has_alpha, bool blend_alpha>
+static void layer_planarrgb_mul_f_c(BYTE** dstp8, const BYTE** ovrp8, const BYTE* maskp8, int dst_pitch, int overlay_pitch, int mask_pitch, int width, int height, float opacity) {
   float* dstp_g = reinterpret_cast<float*>(dstp8[0]);
   float* dstp_b = reinterpret_cast<float*>(dstp8[1]);
   float* dstp_r = reinterpret_cast<float*>(dstp8[2]);
-  float* dstp_a = reinterpret_cast<float*>(dstp8[3]);
+  // dstp8[3]: written only when blend_alpha=true (both clips have alpha).
+  float* dstp_a;
+  if constexpr (blend_alpha)
+    dstp_a = reinterpret_cast<float*>(dstp8[3]);
   const float* ovrp_g = reinterpret_cast<const float*>(ovrp8[0]);
   const float* ovrp_b = reinterpret_cast<const float*>(ovrp8[1]);
   const float* ovrp_r = reinterpret_cast<const float*>(ovrp8[2]);
-  const float* maskp = reinterpret_cast<const float*>(ovrp8[3]);
+  // maskp: per-pixel blend weight — decoupled from ovrp8[3].
+  const float* maskp = reinterpret_cast<const float*>(maskp8);
+  const float* alpha_target;
+  if constexpr (blend_alpha)
+    alpha_target = reinterpret_cast<const float*>(ovrp8[3]);
 
   dst_pitch /= sizeof(float);
   overlay_pitch /= sizeof(float);
+  mask_pitch /= sizeof(float);
 
   for (int y = 0; y < height; ++y) {
     for (int x = 0; x < width; ++x) {
@@ -1398,65 +1348,87 @@ static void layer_planarrgb_mul_f_c(BYTE** dstp8, const BYTE** ovrp8, int dst_pi
         dstp_r[x] = dstp_r[x] + (ovrp_r[x] * dstp_r[x] - dstp_r[x]) * alpha;
         dstp_g[x] = dstp_g[x] + (ovrp_g[x] * dstp_g[x] - dstp_g[x]) * alpha;
         dstp_b[x] = dstp_b[x] + (ovrp_b[x] * dstp_b[x] - dstp_b[x]) * alpha;
-        if constexpr (has_alpha)
-          dstp_a[x] = dstp_a[x] + (maskp[x] * dstp_a[x] - dstp_a[x]) * alpha;
       }
       else { // use luma instead of overlay
         float luma = cyb_f * ovrp_b[x] + cyg_f * ovrp_g[x] + cyr_f * ovrp_r[x];
         dstp_r[x] = dstp_r[x] + (luma * dstp_r[x] - dstp_r[x]) * alpha;
         dstp_g[x] = dstp_g[x] + (luma * dstp_g[x] - dstp_g[x]) * alpha;
         dstp_b[x] = dstp_b[x] + (luma * dstp_b[x] - dstp_b[x]) * alpha;
-        if constexpr (has_alpha)
-          dstp_a[x] = dstp_a[x] + (luma * dstp_a[x] - dstp_a[x]) * alpha;
       }
+      if constexpr (blend_alpha)
+        dstp_a[x] = dstp_a[x] + (alpha_target[x] * dstp_a[x] - dstp_a[x]) * alpha;
     }
     dstp_g += dst_pitch;
     dstp_b += dst_pitch;
     dstp_r += dst_pitch;
-    if constexpr (has_alpha)
+    if constexpr (blend_alpha)
       dstp_a += dst_pitch;
     ovrp_g += overlay_pitch;
     ovrp_b += overlay_pitch;
     ovrp_r += overlay_pitch;
     if constexpr (has_alpha)
-      maskp += overlay_pitch;
+      maskp += mask_pitch;
+    if constexpr (blend_alpha)
+      alpha_target += overlay_pitch;
   }
 }
 
 static void get_layer_planarrgb_mul_functions(
-  bool chroma, bool hasAlpha, int bits_per_pixel,
+  bool chroma, bool hasAlpha, bool blendAlpha, int bits_per_pixel,
   /*out*/layer_planarrgb_mul_c_t** layer_fn,
   /*out*/layer_planarrgb_mul_f_c_t** layer_f_fn)
 {
-#define PLANARRGB_MUL_DISPATCH(chroma, has_alpha) \
+#define PLANARRGB_MUL_DISPATCH(chroma, has_alpha, blend_alpha) \
   { if (bits_per_pixel == 8) \
-    *layer_fn = layer_planarrgb_mul_c<uint8_t, true /*lessthan16bits*/, chroma, has_alpha>; \
+    *layer_fn = layer_planarrgb_mul_c<uint8_t, true /*lessthan16bits*/, chroma, has_alpha, blend_alpha>; \
   else if (bits_per_pixel < 16) \
-    *layer_fn = layer_planarrgb_mul_c<uint16_t, true /*lessthan16bits*/, chroma, has_alpha>; \
+    *layer_fn = layer_planarrgb_mul_c<uint16_t, true /*lessthan16bits*/, chroma, has_alpha, blend_alpha>; \
   else if (bits_per_pixel == 16) \
-    *layer_fn = layer_planarrgb_mul_c<uint16_t, false /*lessthan16bits*/, chroma, has_alpha>; \
+    *layer_fn = layer_planarrgb_mul_c<uint16_t, false /*lessthan16bits*/, chroma, has_alpha, blend_alpha>; \
   else /* float */ \
-    *layer_f_fn = layer_planarrgb_mul_f_c<chroma, has_alpha>; \
+    *layer_f_fn = layer_planarrgb_mul_f_c<chroma, has_alpha, blend_alpha>; \
   }
 
   if (hasAlpha) {
-    // planar RGBA
     if (chroma) {
-      PLANARRGB_MUL_DISPATCH(true, true)
+      if (blendAlpha) { PLANARRGB_MUL_DISPATCH(true, true, true)  }
+      else            { PLANARRGB_MUL_DISPATCH(true, true, false) }
     }
     else {
-      PLANARRGB_MUL_DISPATCH(false, true)
+      if (blendAlpha) { PLANARRGB_MUL_DISPATCH(false, true, true)  }
+      else            { PLANARRGB_MUL_DISPATCH(false, true, false) }
     }
   }
   else {
-    // planar RGB
     if (chroma) {
-      PLANARRGB_MUL_DISPATCH(true, false)
+      PLANARRGB_MUL_DISPATCH(true, false, false)
     }
     else {
-      PLANARRGB_MUL_DISPATCH(false, false)
+      PLANARRGB_MUL_DISPATCH(false, false, false)
     }
   }
 #undef PLANARRGB_MUL_DISPATCH
 }
+
+// ---------------------------------------------------------------------------
+// Packed RGBA (RGB32 / RGB64) blend dispatcher — C reference.
+// Returns the appropriate masked_blend_packedrgba_c instantiation for the
+// given bit depth.  Subtract is handled by pre-inverting the overlay and
+// passing a separate maskp8 pointer in the caller (Layer::Create/GetFrame).
+// The C reference function selects the alpha source at runtime via the
+// maskp8 null-check, so a single function covers both Add and Subtract.
+// ---------------------------------------------------------------------------
+static void get_layer_packedrgb_blend_functions(
+  int bits_per_pixel,
+  layer_packedrgb_blend_c_t** fn)
+{
+  if (bits_per_pixel == 8)
+    *fn = masked_blend_packedrgba_c<uint8_t>;
+  else  // 16-bit (RGB64)
+    *fn = masked_blend_packedrgba_c<uint16_t>;
+}
+
+// Clean up rowprep macros (defined near top of this file or by including TU).
+#undef LAYER_ROWPREP_FN
+#undef LAYER_ROWPREP_LEVEL_FN
 

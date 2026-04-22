@@ -67,6 +67,10 @@ public:
   void setBitsPerPixel(int _bits_per_pixel) { bits_per_pixel = _bits_per_pixel; }
   void setMode(int _of_mode) { of_mode = _of_mode; }
   void setColorSpaceInfo(bool _rgb, bool _greyscale) { rgb = _rgb, greyscale = _greyscale; }
+  // vi: internal working format (currently always YUV444); pl: PLACEMENT_MPEG2 or PLACEMENT_MPEG1
+  void setSubsamplingInfo(const VideoInfo& vi, int pl) { vi_internal = vi; placement = pl; }
+  // greymask: Overlay "greymask" parameter — true when mask clip has only luma information.
+  void setGreyMask(bool gm) { greymask_mask = gm; }
 
   virtual void DoBlendImage(ImageOverlayInternal* base, ImageOverlayInternal* overlay) = 0;
   virtual void DoBlendImageMask(ImageOverlayInternal* base, ImageOverlayInternal* overlay, ImageOverlayInternal* mask) = 0;
@@ -79,7 +83,10 @@ protected:
   int of_mode; // add/subtract, etc
   bool rgb; // add/subtract... overshoot mode is different
   bool greyscale; // having only one plane
+  bool greymask_mask = false; // Overlay "greymask" param: mask has luma info only
   IScriptEnvironment *env;
+  VideoInfo vi_internal;  // internal working format (always YUV444 currently)
+  int placement = PLACEMENT_MPEG2; // chroma placement (for future subsampled Overlay)
 };
 
 class OL_BlendImage : public OverlayFunction {

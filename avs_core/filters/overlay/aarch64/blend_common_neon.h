@@ -36,16 +36,68 @@
 #define __blend_common_neon_h
 
 #include <avs/types.h>
+#include "../blend_common.h"  // MaskMode, masked_merge_fn_t, weighted_merge_fn_t, ...
 
-template<bool has_mask, typename pixel_t>
-void overlay_blend_neon_uint(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch,
-  const int width, const int height, const int opacity, const float opacity_f, const int bits_per_pixel);
-template<bool has_mask>
-void overlay_blend_neon_float(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch,
-  const int width, const int height, const int opacity, const float opacity_f, const int bits_per_pixel);
+// ============================================================
+// Family 1: weighted merge — no mask, weight+invweight == 32768
+// kernel: (p1*invweight + p2*weight + 16384) >> 15
+// ============================================================
+void weighted_merge_neon(BYTE* p1, const BYTE* p2,
+  int p1_pitch, int p2_pitch,
+  int width, int height,
+  int weight, int invweight,
+  int bits_per_pixel);
+
+void weighted_merge_float_neon(BYTE* p1, const BYTE* p2,
+  int p1_pitch, int p2_pitch,
+  int width, int height,
+  float weight_f);
+
+// ============================================================
+// Family 2: masked merge — integer, magic-div normalization.
+//
+// masked_merge_neon_dispatch<maskMode, is_chroma>
+//   Full dispatch used by Overlay (MASK444) and Layer (MASK420/MASK422/…).
+//   opacity pre-scaled: round(opacity_f * max_pixel_value).
+//   Subtract is handled by pre-inverting the overlay before calling (Layer::Create /
+//   Overlay).  No subtract template dimension needed here.
+//   Explicit instantiations for all MaskMode × is_chroma
+//   combinations are provided in blend_common_neon.cpp.
+//
+// masked_merge_neon — convenience entry point fixing MASK444, is_chroma=false.
+//   Mirrors masked_merge_avx2 / masked_merge_c calling their MASK444 impl.
+// ============================================================
+
+// Template declaration — definition + explicit instantiations in .cpp.
+template<MaskMode maskMode>
+void masked_merge_neon_dispatch(BYTE* p1, const BYTE* p2, const BYTE* mask,
+  int p1_pitch, int p2_pitch, int mask_pitch,
+  int width, int height,
+  int opacity, int bits_per_pixel);
+
+// MASK444 convenience (used by OF_blend.cpp Overlay path)
+void masked_merge_neon(BYTE* p1, const BYTE* p2, const BYTE* mask,
+  int p1_pitch, int p2_pitch, int mask_pitch,
+  int width, int height,
+  int opacity, int bits_per_pixel);
+
+// Float masked blend
+void masked_merge_float_neon(BYTE* p1, const BYTE* p2, const BYTE* mask,
+  int p1_pitch, int p2_pitch, int mask_pitch,
+  int width, int height,
+  float opacity_f);
+
+// ============================================================
+// Mode: Darken/Lighten (8-bit only)
+// ============================================================
 void overlay_darken_neon(BYTE* p1Y, BYTE* p1U, BYTE* p1V, const BYTE* p2Y, const BYTE* p2U, const BYTE* p2V, int p1_pitch, int p2_pitch, int width, int height);
 void overlay_lighten_neon(BYTE* p1Y, BYTE* p1U, BYTE* p1V, const BYTE* p2Y, const BYTE* p2U, const BYTE* p2V, int p1_pitch, int p2_pitch, int width, int height);
+
+// ============================================================
+// Overlay blend masked getter.
+// Returns masked_merge_neon_dispatch instantiation for the given is_chroma / maskMode.
+// Overlay always passes MASK444 (internal format is YUV444).
+// ============================================================
+masked_merge_fn_t* get_overlay_blend_masked_fn_neon(bool is_chroma, MaskMode maskMode);
 
 #endif // __blend_common_neon_h

@@ -44,18 +44,9 @@
 
 #include <avisynth.h>
 #include <stdint.h>
+#include "overlay/blend_common.h"  // MaskMode enum + common blend infrastructure
 
-enum { PLACEMENT_MPEG2, PLACEMENT_MPEG1 }; // for Layer 420, 422
-
-// For "Layer"
-enum MaskMode {
-  MASK411,
-  MASK420,
-  MASK420_MPEG2,
-  MASK422,
-  MASK422_MPEG2,
-  MASK444
-};
+// PLACEMENT_MPEG2 / PLACEMENT_MPEG1 defined in blend_common.h (included above)
 
 // called only once, for all planes
 // integer 8-16 bits version
@@ -75,8 +66,8 @@ using layer_yuv_lighten_darken_f_c_t = void (BYTE* dstp8, BYTE* dstp8_u, BYTE* d
   int mask_pitch,
   int width, int height, float level, float thresh);
 
-using layer_planarrgb_lighten_darken_c_t = void(BYTE** dstp8, const BYTE** ovrp8, int dst_pitch, int overlay_pitch, int width, int height, int level, int thresh, int bits_per_pixel);
-using layer_planarrgb_lighten_darken_f_c_t = void(BYTE** dstp8, const BYTE** ovrp8, int dst_pitch, int overlay_pitch, int width, int height, float opacity, float thresh);
+using layer_planarrgb_lighten_darken_c_t = void(BYTE** dstp8, const BYTE** ovrp8, const BYTE* maskp8, int dst_pitch, int overlay_pitch, int mask_pitch, int width, int height, int level, int thresh, int bits_per_pixel);
+using layer_planarrgb_lighten_darken_f_c_t = void(BYTE** dstp8, const BYTE** ovrp8, const BYTE* maskp8, int dst_pitch, int overlay_pitch, int mask_pitch, int width, int height, float opacity, float thresh);
 
 // YUV Mul function pointers
 // integer 8-16 bits version
@@ -89,27 +80,39 @@ using layer_yuv_mul_f_c_t = void(BYTE* dstp8, const BYTE* ovrp8, const BYTE* mas
   int dst_pitch, int overlay_pitch, int mask_pitch,
   int width, int height, float opacity);
 
-// YUV Add/Subtract function pointers (same signatures for both)
-using layer_yuv_add_subtract_c_t = void(BYTE* dstp8, const BYTE* ovrp8, const BYTE* mask8,
+// YUV Add function pointers
+using layer_yuv_add_c_t = void(BYTE* dstp8, const BYTE* ovrp8, const BYTE* mask8,
   int dst_pitch, int overlay_pitch, int mask_pitch,
   int width, int height, int level, int bits_per_pixel);
 
-using layer_yuv_add_subtract_f_c_t = void(BYTE* dstp8, const BYTE* ovrp8, const BYTE* mask8,
+using layer_yuv_add_f_c_t = void(BYTE* dstp8, const BYTE* ovrp8, const BYTE* mask8,
   int dst_pitch, int overlay_pitch, int mask_pitch,
   int width, int height, float opacity);
 
 // integer 8-16 bits version
-using layer_planarrgb_add_subtract_c_t = void(BYTE** dstp8, const BYTE** ovrp8, int dst_pitch, int overlay_pitch, int width, int height, int level, int bits_per_pixel);
+using layer_planarrgb_add_c_t = void(BYTE** dstp8, const BYTE** ovrp8, const BYTE* maskp8, int dst_pitch, int overlay_pitch, int mask_pitch, int width, int height, int level, int bits_per_pixel);
 // 32 bit float version
-using layer_planarrgb_add_subtract_f_c_t = void(BYTE** dstp8, const BYTE** ovrp8, int dst_pitch, int overlay_pitch, int width, int height, float opacity);
+using layer_planarrgb_add_f_c_t = void(BYTE** dstp8, const BYTE** ovrp8, const BYTE* maskp8, int dst_pitch, int overlay_pitch, int mask_pitch, int width, int height, float opacity);
 
 // Planar RGB mul function pointers
 // integer 8-16 bits version
-using layer_planarrgb_mul_c_t = void(BYTE** dstp8, const BYTE** ovrp8,
-  int dst_pitch, int overlay_pitch, int width, int height, int level, int bits_per_pixel);
+using layer_planarrgb_mul_c_t = void(BYTE** dstp8, const BYTE** ovrp8, const BYTE* maskp8,
+  int dst_pitch, int overlay_pitch, int mask_pitch, int width, int height, int level, int bits_per_pixel);
 // 32 bit float version
-using layer_planarrgb_mul_f_c_t = void(BYTE** dstp8, const BYTE** ovrp8,
-  int dst_pitch, int overlay_pitch, int width, int height, float opacity);
+using layer_planarrgb_mul_f_c_t = void(BYTE** dstp8, const BYTE** ovrp8, const BYTE* maskp8,
+  int dst_pitch, int overlay_pitch, int mask_pitch, int width, int height, float opacity);
+
+// Packed RGBA (RGB32 / RGB64) blend — magic-div arithmetic.
+// opacity_i is in [0..max_pixel_value].
+// maskp8: if non-null, points to a separate 1-channel (Y) alpha plane used as the
+//   per-pixel blend weight instead of ovrp8's own alpha component (offset +3).
+//   Used for Subtract: Create() extracts the original alpha before pre-inverting
+//   the overlay, then passes it here.  Add passes nullptr → weight from ovrp8[x*4+3].
+// mask_pitch: row stride of maskp8 in bytes (0 when maskp8 == nullptr).
+// See masked_blend_packedrgba_c in blend_common.h for the reference implementation.
+using layer_packedrgb_blend_c_t = void(BYTE* dstp8, const BYTE* ovrp8, const BYTE* maskp8,
+  int dst_pitch, int ovr_pitch, int mask_pitch,
+  int width, int height, int opacity_i);
 
 /********************************************************************
 ********************************************************************/
@@ -315,7 +318,7 @@ class Layer : public IClip
    **/
 {
 public:
-  Layer(PClip _child1, PClip _child2, const char _op[], int _lev, int _x, int _y,
+  Layer(PClip _child1, PClip _child2, PClip _mask_child, const char _op[], int _lev, int _x, int _y,
     int _t, bool _chroma, float _strength, int _placement, IScriptEnvironment* env);
   PVideoFrame __stdcall GetFrame(int n, IScriptEnvironment* env) override;
 
@@ -341,12 +344,17 @@ public:
 
 private:
   const PClip child1, child2;
+  // Pre-Subtract Invert alpha save: ExtractA of the overlay before all-channel Invert.
+  // Used as the per-pixel mask weight while ovrp[3] (inverted A) serves as the alpha target.
+  // nullptr for all ops other than Subtract, and for Subtract when overlay has no alpha.
+  const PClip mask_child;
   VideoInfo vi;
   const  char* Op;
   int levelB, ThresholdParam;
   int ydest, xdest, ysrc, xsrc, ofsX, ofsY, ycount, xcount, overlay_frames;
   const bool chroma;
-  bool hasAlpha;
+  bool hasAlpha;             // overlay has alpha plane → per-pixel blend weight
+  bool process_alpha_channel; // both clips have alpha → blend A channel like colour channels
   int bits_per_pixel;
   float opacity; // like in "Overlay"
   int placement; // PLACEMENT_MPEG1 or PLACEMENT_MPEG2

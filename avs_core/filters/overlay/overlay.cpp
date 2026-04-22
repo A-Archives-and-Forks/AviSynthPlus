@@ -49,8 +49,22 @@
 ***** Declare index of new filters for Avisynth's filter engine *****
 ********************************************************************/
 
+static int getPlacement(const AVSValue& _placement, IScriptEnvironment* env) {
+  const char* placement = _placement.AsString(0);
+  if (placement) {
+    if (!lstrcmpi(placement, "mpeg2"))
+      return PLACEMENT_MPEG2;
+    if (!lstrcmpi(placement, "mpeg1"))
+      return PLACEMENT_MPEG1;
+    if (!lstrcmpi(placement, "top_left"))
+      return PLACEMENT_TOPLEFT;
+    env->ThrowError("Overlay: Unknown chroma placement");
+  }
+  return PLACEMENT_MPEG2;
+}
+
 extern const AVSFunction Overlay_filters[] = {
-  { "Overlay", BUILTIN_FUNC_PREFIX, "cc[x]i[y]i[mask]c[opacity]f[mode]s[greymask]b[output]s[ignore_conditional]b[PC_Range]b[use444]b[condvarsuffix]s", Overlay::Create },
+  { "Overlay", BUILTIN_FUNC_PREFIX, "cc[x]i[y]i[mask]c[opacity]f[mode]s[greymask]b[output]s[ignore_conditional]b[PC_Range]b[use444]b[condvarsuffix]s[placement]s", Overlay::Create },
     // 0, src clip
     // 1, overlay clip
     // 2, x
@@ -64,6 +78,7 @@ extern const AVSFunction Overlay_filters[] = {
     // 10, full YUV range.
     // 11, ignore 4:4:4 conversion
     // 12, conditional variable suffix AVS+
+    // 13, chroma placement "mpeg2" (default) or "mpeg1"
   { 0 }
 };
 
@@ -80,7 +95,8 @@ enum {
   ARG_IGNORE_CONDITIONAL = 9,
   ARG_FULL_RANGE = 10,
   ARG_USE444 = 11, // 170103 possible conversionless option experimental
-  ARG_CONDVARSUFFIX = 12 // 190408
+  ARG_CONDVARSUFFIX = 12, // 190408
+  ARG_PLACEMENT = 13
 };
 
 static int getPixelTypeWithoutAlpha(VideoInfo& vi)
@@ -99,6 +115,7 @@ GenericVideoFilter(_child), child444(nullptr) {
   use444 = args[ARG_USE444].AsBool(true);  // avs+ option to use 444-conversionless mode
   name = args[ARG_MODE].AsString("Blend");
   condVarSuffix = args[ARG_CONDVARSUFFIX].AsString("");
+  placement = getPlacement(args[ARG_PLACEMENT], env);
 
   // Make copy of the VideoInfo
   inputVi = vi;
@@ -697,6 +714,8 @@ PVideoFrame __stdcall Overlay::GetFrame(int n, IScriptEnvironment *env) {
     func->setBitsPerPixel(bits_per_pixel);
     func->setOpacity(opacity + op_offset, opacity_f + op_offset_f);
     func->setColorSpaceInfo(viInternalWorkingFormat.IsRGB(), viInternalWorkingFormat.IsY());
+    func->setSubsamplingInfo(viInternalWorkingFormat, placement);
+    func->setGreyMask(greymask);
     func->setEnv(env);
 
     if (!mask) {

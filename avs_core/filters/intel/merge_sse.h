@@ -43,15 +43,8 @@
 
 #include <avisynth.h>
 
-template<bool lessthan16bit>
-void weighted_merge_planar_uint16_sse2(BYTE *p1, const BYTE *p2, int p1_pitch, int p2_pitch, int rowsize, int height, float weight_f, int weight_i, int invweight_i);
-
-void weighted_merge_planar_sse2(BYTE *p1,const BYTE *p2, int p1_pitch, int p2_pitch,int rowsize, int height, float weight_f, int weight_i, int invweight_i);
-
-#ifdef X86_32
-void weighted_merge_planar_mmx(BYTE *p1,const BYTE *p2, int p1_pitch, int p2_pitch,int rowsize, int height, float weight_f, int weight_i, int invweight_i);
-#endif
-void weighted_merge_planar_sse2_float(BYTE *p1, const BYTE *p2, int p1_pitch, int p2_pitch, int rowsize, int height, float weight_f, int weight_i, int invweight_i);
+// weighted_merge_planar SSE2 implementations moved to overlay/intel/blend_common_sse.cpp
+// (see weighted_merge_sse2 / weighted_merge_float_sse2)
 
 #ifdef X86_32
 void weighted_merge_chroma_yuy2_mmx(BYTE* src, const BYTE* chroma, int pitch, int chroma_pitch, int width, int height, int weight, int invweight);
