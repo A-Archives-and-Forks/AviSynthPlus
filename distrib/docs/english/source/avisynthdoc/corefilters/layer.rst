@@ -31,9 +31,22 @@ Note that some modes can be similar to :doc:`Overlay <overlay>`, but the two fil
     the alpha channel is used as a mask. Non-alpha plane YUV/planar RGB color spaces act as having 
     a fully transparent alpha channel. Color format must match base_clip.
 
-    Note: if destination is YUVA/RGBA, the overlay clip also has to be Alpha-aware type.
-    Alpha channel is not updated for YUVA targets, but RGBA targets do get the Alpha 
-    updated (like the old RGB32 mode did - compatibility)
+    Note: if destination is YUVA or planar RGBA, the overlay clip must also be an alpha-aware type.
+
+    **Alpha plane update behaviour** (destination alpha after the operation):
+
+    For modes other than 'Add' or 'Subtract' all packed RGB formats (RGB24/32/48/64) are 
+    internally converted to planar before processing and post-converted back; the rules 
+    below apply to the planar representation.
+
+    - **Both clips alpha-aware** (e.g. YUVA+YUVA, PlanarRGBA+PlanarRGBA, RGB32+RGB32):
+      destination alpha **is** updated by every operation using the same formula applied to
+      the colour channels.  The overlay alpha serves as both the per-pixel blend weight and
+      the target value for the alpha channel blend.
+    - **Only overlay has alpha** (e.g. PlanarRGB base + PlanarRGBA overlay):
+      overlay alpha is used as a per-pixel blend weight for the colour channels only;
+      destination alpha is **not written**.
+    - **Only base has alpha, or neither has alpha**: destination alpha is **not written**.
 
 .. describe:: op
 
@@ -219,13 +232,19 @@ Note that some modes can be similar to :doc:`Overlay <overlay>`, but the two fil
 
 .. describe:: placement
 
-    chroma placement for 420 and 422 YUV formats.
+    Chroma placement for 4:2:0 and 4:2:2 YUV formats.
+    
+    default=``"mpeg2"`` 
 
-    Possible values: "mpeg2" (default), "mpeg1".
+    Possible values: ``"mpeg2"`` (default), ``"mpeg1"``, ``"top_left"``.
 
-    Used in "mul", "darken" and "lighten", "add" and "subtract" modes with planar YUV 
-    4:2:0 or 4:2:2 color spaces (not available for YUY2) in order to properly apply 
-    luma/overlay mask on U and V chroma channels. 
+    Used in "mul", "darken", "lighten", "add" and "subtract" modes with planar YUV
+    4:2:0 or 4:2:2 color spaces (not available for YUY2) to correctly filter the
+    luma-resolution alpha mask down to chroma resolution for the U and V planes.
+
+    * ``"mpeg2"`` — left-cosited H, centred V (MPEG-2 / H.264 default; triangle filter).
+    * ``"mpeg1"`` — centred H+V (MPEG-1 / JPEG; box filter).
+    * ``"top_left"`` — left-cosited H+V (HEVC / AV1 / UHD default; point sample, fastest).
 
 Other notes
 -----------
@@ -264,6 +283,8 @@ Changelog
 +-----------------+---------------------------------------------------------------+
 | Version         | Changes                                                       |
 +=================+===============================================================+
+| 3.7.6           | Layer: Add 'top_left' option for "placement"                  |
++-----------------+---------------------------------------------------------------+
 | 3.5.0           | Layer: support RGB24 and RGB48                                |
 +-----------------+---------------------------------------------------------------+
 | 3.4.0           | | Layer: support almost all formats, not only RGB32 and YUY2  |
@@ -277,6 +298,6 @@ Changelog
 +-----------------+---------------------------------------------------------------+
 
 
-$Date: 2025/01/15 13:15:00 $
+$Date: 2026/04/22 11:12:00 $
 
 .. _in this thread: http://forum.doom9.org/showthread.php?s=&threadid=28438

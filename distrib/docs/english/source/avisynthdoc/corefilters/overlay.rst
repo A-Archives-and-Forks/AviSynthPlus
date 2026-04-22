@@ -32,9 +32,9 @@ Syntax and Parameters
 ::
 
     Overlay (clip, clip overlay, int "x", int "y", clip "mask", float "opacity",
-             string "mode", bool "greymask", string "output", 
-             bool "ignore_conditional", bool "pc_range", bool "use444", 
-             string "condvarsuffix")
+             string "mode", bool "greymask", string "output",
+             bool "ignore_conditional", bool "pc_range", bool "use444",
+             string "condvarsuffix", string "placement")
 
 .. describe:: clip
 
@@ -192,17 +192,22 @@ Syntax and Parameters
 
 .. describe:: use444
 
-    If set to false, Overlay uses conversionless mode where possible instead of going 
-    through YUV 4:4:4. However, for ``Luma`` and ``Chroma`` modes, RGB must be converted 
+    If set to false, Overlay uses conversionless mode where possible instead of going
+    through YUV 4:4:4. However, for ``Luma`` and ``Chroma`` modes, RGB must be converted
     to YUV 4:4:4.
-    
-    Default: (adaptive) 
-    
-    * false when mode="blend" and format is RGB 
-    * false when mode="blend", "luma" or "chroma" and format is YUV420/YUV422 (YV12/YV16). 
-      Original format is kept throughout the whole process, no 4:4:4 conversion occurs. 
-    * false when mode="add" or mode="subtract" and format is RGB 
+
+    Default: (adaptive)
+
+    * false when mode="blend" and format is RGB
+    * false when mode="blend", "luma" or "chroma" and format is YUV420/YUV422 (YV12/YV16).
+      Original format is kept throughout the whole process, no 4:4:4 conversion occurs.
+    * false when mode="add" or mode="subtract" and format is RGB
     * true for all other cases (input is converted internally to 4:4:4)
+
+    When ``use444=false`` (conversionless mode) is in effect for a subsampled YUV format
+    (4:2:0 or 4:2:2) and ``greymask=true`` (default), the luma-resolution mask is
+    downsampled to chroma resolution on the fly. The ``placement`` parameter controls
+    the filter weights used for this downsampling.
 
 .. describe:: condvarsuffix
 
@@ -236,6 +241,40 @@ Syntax and Parameters
 
     Default: ""
 
+.. describe:: placement
+
+    Specifies the chroma sample placement for subsampled YUV formats (4:2:0 or 4:2:2).
+    Accepted values (case-insensitive): ``"mpeg2"``, ``"mpeg1"``, and ``"top_left"``.
+
+    This parameter is only relevant when all three of the following are true:
+
+    * ``use444=false`` (conversionless mode is active for a subsampled format), AND
+    * ``greymask=true`` (default — mask luma plane is used for all chroma planes), AND
+    * the internal working format is subsampled (YUV 4:2:0 or 4:2:2).
+
+    When those conditions hold, the luma-resolution mask is filtered down to chroma
+    resolution once per row (shared for U and V), and the filter weights depend on
+    the declared chroma placement of the source material:
+
+    * ``"mpeg2"`` — chroma samples are co-sited with the left luma column
+      (MPEG-2 / H.264 / H.265 default; left-aligned). This is a 3-tap horizontal
+      triangle filter: ``(left + 2*centre + right) / 4``.
+      For 4:2:0 an additional vertical 2-row sum is folded in:
+      ``(left + 2*centre + right) / 8`` (summing both field rows first).
+    * ``"mpeg1"`` — chroma samples are centred between luma columns
+      (MPEG-1 / JPEG). This is a simple box average: ``(left + right) / 2``.
+      For 4:2:0 a 2×2 box average is used.
+    * ``"top_left"`` — chroma samples are co-sited both horizontally and vertically
+      with the top-left luma sample (HEVC / AV1 / UHD default). This is a point sample:
+      ``dst = src[x*2]``, taking only the left-aligned luma sample.
+      For 4:2:0 only the top row is used. This is the fastest option but introduces
+      some aliasing compared to the filtered modes.
+
+    When ``use444=true`` or the source is not subsampled, this parameter has no
+    effect: the mask is already at the chroma plane's full resolution (MASK444
+    mode is always used internally in those cases).
+
+    Default: ``"mpeg2"``
 
 
 RGB considerations
@@ -516,6 +555,10 @@ Test script for different bit depths with and without masks
 | 3.7.6     | | "add", and "subtract" supports 32-bit float input.                   |
 |           | | "add" and "subtract" support RGB input without 4:4:4 conversion.     |
 |           | | Check for unsupported 32-bit float, such modes give error.           |
+|           | | Add ``placement`` parameter ("mpeg2" default, "mpeg1", or            |
+|           |   "top_left").                                                         |
+|           | | Relevant for conversionless mode (``use444=false``) with subsampled  |
+|           |   YUV and greymask.                                                    |
 +-----------+------------------------------------------------------------------------+
 | 3.7.2     | Address issue #255: "blend": now using accurate formula using float    |
 |           | calculation internally.                                                |
@@ -547,6 +590,6 @@ Test script for different bit depths with and without masks
 | v2.54     | Initial Release                                                        |
 +-----------+------------------------------------------------------------------------+
 
-$Date: 2025/11/22 10:35:50 $
+$Date: 2026/04/22 11:12:00 $
 
 .. _here: http://forum.doom9.org/showthread.php?s=&threadid=28438
