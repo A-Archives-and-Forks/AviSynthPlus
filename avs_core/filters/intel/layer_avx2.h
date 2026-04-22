@@ -43,8 +43,16 @@ void mask_avx2(BYTE* srcp, const BYTE* alphap, int src_pitch, int alpha_pitch, s
 void colorkeymask_avx2(BYTE* pf, int pitch, int color, int height, int width, int tolB, int tolG, int tolR);
 void invert_frame_inplace_avx2(BYTE* frame, int pitch, int width, int height, int mask);
 void invert_frame_uint16_inplace_avx2(BYTE* frame, int pitch, int width, int height, uint64_t mask64);
-template<typename pixel_t, bool lessthan16bits, bool chroma>
-void invert_plane_c_avx2(uint8_t* dstp, const uint8_t* srcp, int src_pitch, int dst_pitch, int width, int height, int bits_per_pixel);
+template<bool chroma>
+void invert_plane_avx2_u8(uint8_t* dstp, const uint8_t* srcp, int src_pitch, int dst_pitch, int width, int height, int bits_per_pixel);
+
+// 10/12/14/16-bit luma/chroma plane inversion (AVX2).
+template<bool chroma>
+void invert_plane_avx2_u16(uint8_t* dstp, const uint8_t* srcp, int src_pitch, int dst_pitch, int width, int height, int bits_per_pixel);
+
+// 32-bit float luma/chroma plane inversion (AVX2).
+template<bool chroma>
+void invert_plane_avx2_f32(uint8_t* dstp, const uint8_t* srcp, int src_pitch, int dst_pitch, int width, int height, int bits_per_pixel);
 
 void layer_yuy2_or_rgb32_fast_avx2(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
 template<typename pixel_t>

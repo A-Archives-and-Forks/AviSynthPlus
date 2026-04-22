@@ -265,6 +265,74 @@ void invert_frame_uint16_inplace_sse2(BYTE* frame, int pitch, int width, int hei
   }
 }
 
+template<bool chroma>
+void invert_plane_sse2_u8(uint8_t* dstp, const uint8_t* srcp, int src_pitch, int dst_pitch, int width, int height, int /*bits_per_pixel*/)
+{
+  const __m128i v_ff = _mm_set1_epi8((char)0xFF);
+  const __m128i v_one = _mm_set1_epi8(1);
+  for (int y = 0; y < height; ++y) {
+    
+    for (int x = 0; x < width; x += 16) {
+      __m128i s = _mm_load_si128(reinterpret_cast<const __m128i*>(srcp + x));
+      __m128i r;
+      if constexpr (chroma)
+        r = _mm_xor_si128(_mm_subs_epu8(s, v_one), v_ff);
+      else
+        r = _mm_xor_si128(s, v_ff);
+      _mm_store_si128(reinterpret_cast<__m128i*>(dstp + x), r);
+    }
+    srcp += src_pitch;
+    dstp += dst_pitch;
+  }
+}
+
+template<bool chroma>
+void invert_plane_sse2_u16(uint8_t* dstp, const uint8_t* srcp, int src_pitch, int dst_pitch, int width, int height, int bits_per_pixel)
+{
+  const int max_pixel_value = (1 << bits_per_pixel) - 1;
+  const __m128i v_max = _mm_set1_epi16((short)max_pixel_value);
+  const __m128i v_one = _mm_set1_epi16(1);
+  for (int y = 0; y < height; ++y) {
+    const uint16_t* s16 = reinterpret_cast<const uint16_t*>(srcp);
+    uint16_t* d16 = reinterpret_cast<uint16_t*>(dstp);
+    for (int x = 0; x < width; x += 8) {
+      __m128i s = _mm_load_si128(reinterpret_cast<const __m128i*>(s16 + x));
+      __m128i r;
+      if constexpr (chroma)
+        r = _mm_xor_si128(_mm_subs_epu16(s, v_one), v_max);
+      else
+        r = _mm_xor_si128(s, v_max);
+      _mm_store_si128(reinterpret_cast<__m128i*>(d16 + x), r);
+    }
+    srcp += src_pitch;
+    dstp += dst_pitch;
+  }
+}
+
+template<bool chroma>
+void invert_plane_sse2_f32(uint8_t* dstp, const uint8_t* srcp, int src_pitch, int dst_pitch, int width, int height, int /*bits_per_pixel*/)
+{
+  const __m128 v_one = _mm_set1_ps(1.0f);
+  const __m128 v_sign = _mm_set1_ps(-0.0f);
+  for (int y = 0; y < height; ++y) {
+    const float* sf = reinterpret_cast<const float*>(srcp);
+    float* df = reinterpret_cast<float*>(dstp);
+    for (int x = 0; x < width; x += 4) {
+      __m128 s = _mm_load_ps(sf + x);
+      __m128 r = chroma ? _mm_xor_ps(s, v_sign) : _mm_sub_ps(v_one, s);
+      _mm_store_ps(df + x, r);
+    }
+    srcp += src_pitch; dstp += dst_pitch;
+  }
+}
+
+template void invert_plane_sse2_u8<false>(uint8_t*, const uint8_t*, int, int, int, int, int);
+template void invert_plane_sse2_u8<true>(uint8_t*, const uint8_t*, int, int, int, int, int);
+template void invert_plane_sse2_u16<false>(uint8_t*, const uint8_t*, int, int, int, int, int);
+template void invert_plane_sse2_u16<true>(uint8_t*, const uint8_t*, int, int, int, int, int);
+template void invert_plane_sse2_f32<false>(uint8_t*, const uint8_t*, int, int, int, int, int);
+template void invert_plane_sse2_f32<true>(uint8_t*, const uint8_t*, int, int, int, int, int);
+
 /*******************************
  *******   Layer Filter   ******
  *******************************/

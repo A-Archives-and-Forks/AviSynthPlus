@@ -42,6 +42,13 @@ void mask_sse2(BYTE* srcp, const BYTE* alphap, int src_pitch, int alpha_pitch, s
 void colorkeymask_sse2(BYTE* pf, int pitch, int color, int height, int width, int tolB, int tolG, int tolR);
 void invert_frame_inplace_sse2(BYTE* frame, int pitch, int width, int height, int mask);
 void invert_frame_uint16_inplace_sse2(BYTE* frame, int pitch, int width, int height, uint64_t mask64);
+template<bool chroma>
+void invert_plane_sse2_u8(uint8_t* dstp, const uint8_t* srcp, int src_pitch, int dst_pitch, int width, int height, int bits_per_pixel);
+template<bool chroma>
+void invert_plane_sse2_u16(uint8_t* dstp, const uint8_t* srcp, int src_pitch, int dst_pitch, int width, int height, int bits_per_pixel);
+template<bool chroma>
+void invert_plane_sse2_f32(uint8_t* dstp, const uint8_t* srcp, int src_pitch, int dst_pitch, int width, int height, int bits_per_pixel);
+
 template<bool use_chroma>
 void layer_yuy2_or_rgb32_fast_sse2(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
 template<typename pixel_t>
