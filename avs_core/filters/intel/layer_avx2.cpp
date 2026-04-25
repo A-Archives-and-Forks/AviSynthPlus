@@ -183,7 +183,6 @@ void invert_plane_avx2_u8(uint8_t* dstp, const uint8_t* srcp, int src_pitch, int
   const __m256i v_one = _mm256_set1_epi8(1);
 
   for (int y = 0; y < height; ++y) {
-    int x = 0;
     for (int x = 0; x < width; x += 32) {
       __m256i s = _mm256_load_si256(reinterpret_cast<const __m256i*>(srcp + x));
       __m256i r;

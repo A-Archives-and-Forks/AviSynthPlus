@@ -112,65 +112,6 @@ void mask_sse2(BYTE* srcp, const BYTE* alphap, int src_pitch, int alpha_pitch, s
   }
 }
 
-#ifdef X86_32
-
-static AVS_FORCEINLINE __m64 mask_core_mmx(__m64& src, __m64& alpha, __m64& not_alpha_mask, __m64& zero, __m64& matrix, __m64& round_mask) {
-  __m64 not_alpha = _mm_and_si64(src, not_alpha_mask);
-
-  __m64 pixel0 = _mm_unpacklo_pi8(alpha, zero);
-  __m64 pixel1 = _mm_unpackhi_pi8(alpha, zero);
-
-  pixel0 = _mm_madd_pi16(pixel0, matrix); //a0*0 + r0*cyr | g0*cyg + b0*cyb
-  pixel1 = _mm_madd_pi16(pixel1, matrix); //a1*0 + r1*cyr | g1*cyg + b1*cyb
-
-  __m64 tmp = _mm_unpackhi_pi32(pixel0, pixel1); // r1*cyr | r0*cyr
-  __m64 tmp2 = _mm_unpacklo_pi32(pixel0, pixel1); // g1*cyg + b1*cyb | g0*cyg + b0*cyb
-
-  tmp = _mm_add_pi32(tmp, tmp2); // r1*cyr + g1*cyg + b1*cyb | r0*cyr + g0*cyg + b0*cyb
-  tmp = _mm_add_pi32(tmp, round_mask); // r1*cyr + g1*cyg + b1*cyb + 16384 | r0*cyr + g0*cyg + b0*cyb + 16384
-  tmp = _mm_srli_pi32(tmp, 15); // 0 0 0 p2 | 0 0 0 p1
-  __m64 result_alpha = _mm_slli_pi32(tmp, 24);
-
-  return _mm_or_si64(result_alpha, not_alpha);
-}
-
-void mask_mmx(BYTE* srcp, const BYTE* alphap, int src_pitch, int alpha_pitch, size_t width, size_t height) {
-  __m64 matrix = _mm_set_pi16(0, cyr, cyg, cyb);
-  __m64 zero = _mm_setzero_si64();
-  __m64 round_mask = _mm_set1_pi32(16384);
-  __m64 not_alpha_mask = _mm_set1_pi32(0x00FFFFFF);
-
-  size_t width_bytes = width * 4;
-  size_t width_mod8 = width_bytes / 8 * 8;
-
-  for (size_t y = 0; y < height; ++y) {
-    for (size_t x = 0; x < width_mod8; x += 8) {
-      __m64 src = *reinterpret_cast<const __m64*>(srcp + x); //pixels 0 and 1
-      __m64 alpha = *reinterpret_cast<const __m64*>(alphap + x);
-      __m64 result = mask_core_mmx(src, alpha, not_alpha_mask, zero, matrix, round_mask);
-
-      *reinterpret_cast<__m64*>(srcp + x) = result;
-    }
-
-    if (width_mod8 < width_bytes) {
-      __m64 src = _mm_cvtsi32_si64(*reinterpret_cast<const int*>(srcp + width_bytes - 4));
-      __m64 alpha = _mm_cvtsi32_si64(*reinterpret_cast<const int*>(alphap + width_bytes - 4));
-
-      __m64 result = mask_core_mmx(src, alpha, not_alpha_mask, zero, matrix, round_mask);
-
-      *reinterpret_cast<int*>(srcp + width_bytes - 4) = _mm_cvtsi64_si32(result);
-    }
-
-    srcp += src_pitch;
-    alphap += alpha_pitch;
-  }
-  _mm_empty();
-}
-
-#endif
-
-
-
 void colorkeymask_sse2(BYTE* pf, int pitch, int color, int height, int width, int tolB, int tolG, int tolR) {
   unsigned int t = 0xFF000000 | (tolR << 16) | (tolG << 8) | tolB;
   __m128i tolerance = _mm_set1_epi32(t);
@@ -196,47 +137,6 @@ void colorkeymask_sse2(BYTE* pf, int pitch, int color, int height, int width, in
     pf += 16;
   }
 }
-
-#ifdef X86_32
-
-static AVS_FORCEINLINE __m64 colorkeymask_core_mmx(const __m64& src, const __m64& colorv, const __m64& tolerance, const __m64& zero) {
-  __m64 gt = _mm_subs_pu8(colorv, src);
-  __m64 lt = _mm_subs_pu8(src, colorv);
-  __m64 absdiff = _mm_or_si64(gt, lt); //abs(color - src)
-
-  __m64 not_passed = _mm_subs_pu8(absdiff, tolerance);
-  __m64 passed = _mm_cmpeq_pi32(not_passed, zero);
-  passed = _mm_slli_pi32(passed, 24);
-  return _mm_andnot_si64(passed, src);
-}
-
-void colorkeymask_mmx(BYTE* srcp, int pitch, int color, int height, int width, int tolB, int tolG, int tolR) {
-  __m64 tolerance = _mm_set_pi8((char)0xFF, tolR, tolG, tolB, (char)0xFF, tolR, tolG, tolB);
-  __m64 colorv = _mm_set1_pi32(color);
-  __m64 zero = _mm_setzero_si64();
-
-  int mod8_width = width / 8 * 8;
-
-  for (int y = 0; y < height; ++y) {
-    for (int x = 0; x < mod8_width; x += 8) {
-      __m64 src = *reinterpret_cast<const __m64*>(srcp + x);
-      __m64 result = colorkeymask_core_mmx(src, colorv, tolerance, zero);
-      *reinterpret_cast<__m64*>(srcp + x) = result;
-    }
-
-    if (mod8_width != width) {
-      __m64 src = _mm_cvtsi32_si64(*reinterpret_cast<const int*>(srcp + width - 4));
-      __m64 result = colorkeymask_core_mmx(src, colorv, tolerance, zero);
-      *reinterpret_cast<int*>(srcp + width - 4) = _mm_cvtsi64_si32(result);
-    }
-
-    srcp += pitch;
-  }
-
-  _mm_empty();
-}
-
-#endif
 
 
 void invert_frame_inplace_sse2(BYTE* frame, int pitch, int width, int height, int mask) {
@@ -337,9 +237,9 @@ template void invert_plane_sse2_f32<true>(uint8_t*, const uint8_t*, int, int, in
  *******   Layer Filter   ******
  *******************************/
 
-void layer_yuy2_or_rgb32_fast_sse2(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level) {
+void layer_rgb32_fast_sse2(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level) {
   AVS_UNUSED(level);
-  int width_bytes = width * 2;
+  int width_bytes = width * 4;
   int width_mod16 = width_bytes / 16 * 16;
 
   for (int y = 0; y < height; ++y) {
@@ -412,16 +312,6 @@ static AVS_FORCEINLINE __m128i calculate_luma_sse2(const __m128i& src, const __m
   return _mm_shufflehi_epi16(result, _MM_SHUFFLE(0, 0, 0, 0));
 }
 
-#ifdef X86_32
-static AVS_FORCEINLINE __m64 calculate_luma_isse(const __m64& src, const __m64& rgb_coeffs, const __m64& zero) {
-  __m64 temp = _mm_madd_pi16(src, rgb_coeffs);
-  __m64 low = _mm_unpackhi_pi32(temp, zero);
-  temp = _mm_add_pi32(low, temp);
-  temp = _mm_srli_pi32(temp, 15);
-  return _mm_shuffle_pi16(temp, _MM_SHUFFLE(0, 0, 0, 0));
-}
-#endif
-
 // must be unaligned load/store
 template<bool use_chroma>
 void layer_rgb32_mul_sse2(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level) {
@@ -490,55 +380,6 @@ void layer_rgb32_mul_sse2(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overl
 // instantiate
 template void layer_rgb32_mul_sse2<false>(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
 template void layer_rgb32_mul_sse2<true>(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
-
-
-#ifdef X86_32
-template<bool use_chroma>
-void layer_rgb32_mul_isse(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level) {
-  __m64 zero = _mm_setzero_si64();
-  __m64 rgb_coeffs = _mm_set_pi16(0, cyr, cyg, cyb);
-
-  for (int y = 0; y < height; ++y) {
-    for (int x = 0; x < width; ++x) {
-      __m64 src = _mm_cvtsi32_si64(*reinterpret_cast<const int*>(dstp + x * 4));
-      __m64 ovr = _mm_cvtsi32_si64(*reinterpret_cast<const int*>(ovrp + x * 4));
-
-      __m64 alpha = _mm_cvtsi32_si64((ovrp[x * 4 + 3] * level + 1) >> 8);
-      alpha = _mm_shuffle_pi16(alpha, _MM_SHUFFLE(0, 0, 0, 0));
-
-      src = _mm_unpacklo_pi8(src, zero);
-      ovr = _mm_unpacklo_pi8(ovr, zero);
-
-      __m64 luma;
-      if (use_chroma) {
-        luma = ovr;
-      }
-      else {
-        luma = calculate_luma_isse(ovr, rgb_coeffs, zero);
-      }
-
-      __m64 dst = _mm_mullo_pi16(luma, src);
-      dst = _mm_srli_pi16(dst, 8);
-      dst = _mm_subs_pi16(dst, src);
-      dst = _mm_mullo_pi16(dst, alpha);
-      dst = _mm_srli_pi16(dst, 8);
-      dst = _mm_add_pi8(src, dst);
-
-      dst = _mm_packs_pu16(dst, zero);
-
-      *reinterpret_cast<int*>(dstp + x * 4) = _mm_cvtsi64_si32(dst);
-    }
-    dstp += dst_pitch;
-    ovrp += overlay_pitch;
-  }
-  _mm_empty();
-}
-
-// instantiate
-template void layer_rgb32_mul_isse<false>(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
-template void layer_rgb32_mul_isse<true>(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
-
-#endif
 
 
 // must be unaligned load/store
@@ -612,60 +453,6 @@ void layer_rgb32_add_sse2(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overl
 template void layer_rgb32_add_sse2<false>(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
 template void layer_rgb32_add_sse2<true>(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
 
-#ifdef X86_32
-template<bool use_chroma>
-void layer_rgb32_add_isse(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level) {
-  __m64 zero = _mm_setzero_si64();
-  __m64 rgb_coeffs = _mm_set_pi16(0, cyr, cyg, cyb);
-
-  constexpr int rounder = 128;
-  const __m64 rounder_simd = _mm_set1_pi16(rounder);
-
-  for (int y = 0; y < height; ++y) {
-    for (int x = 0; x < width; ++x) {
-      __m64 src = _mm_cvtsi32_si64(*reinterpret_cast<const int*>(dstp + x * 4));
-      __m64 ovr = _mm_cvtsi32_si64(*reinterpret_cast<const int*>(ovrp + x * 4));
-
-      __m64 alpha = _mm_cvtsi32_si64((ovrp[x * 4 + 3] * level + 1) >> 8);
-      alpha = _mm_shuffle_pi16(alpha, _MM_SHUFFLE(0, 0, 0, 0));
-
-      src = _mm_unpacklo_pi8(src, zero);
-      ovr = _mm_unpacklo_pi8(ovr, zero);
-
-      __m64 luma;
-      if (use_chroma) {
-        luma = ovr;
-      }
-      else {
-        luma = calculate_luma_isse(ovr, rgb_coeffs, zero);
-      }
-
-      __m64 dst = _mm_subs_pi16(luma, src);
-      dst = _mm_mullo_pi16(dst, alpha);
-      dst = _mm_add_pi16(dst, rounder_simd);
-      dst = _mm_srli_pi16(dst, 8);
-      dst = _mm_add_pi8(src, dst);
-
-      dst = _mm_packs_pu16(dst, zero);
-
-      *reinterpret_cast<int*>(dstp + x * 4) = _mm_cvtsi64_si32(dst);
-    }
-    dstp += dst_pitch;
-    ovrp += overlay_pitch;
-  }
-  _mm_empty();
-}
-
-// instantiate
-template void layer_rgb32_add_isse<false>(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
-template void layer_rgb32_add_isse<true>(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
-#endif
-
-
-
-void layer_rgb32_fast_sse2(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level) {
-  layer_yuy2_or_rgb32_fast_sse2(dstp, ovrp, dst_pitch, overlay_pitch, width * 2, height, level);
-}
 
 
 template<bool use_chroma>
@@ -738,58 +525,6 @@ void layer_rgb32_subtract_sse2(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int 
 // instantiate
 template void layer_rgb32_subtract_sse2<false>(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
 template void layer_rgb32_subtract_sse2<true>(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
-
-#ifdef X86_32
-template<bool use_chroma>
-void layer_rgb32_subtract_isse(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level) {
-  __m64 zero = _mm_setzero_si64();
-  __m64 rgb_coeffs = _mm_set_pi16(0, cyr, cyg, cyb);
-  __m64 ff = _mm_set1_pi16(0x00FF);
-
-  constexpr int rounder = 128;
-  const __m64 rounder_simd = _mm_set1_pi16(rounder);
-
-  for (int y = 0; y < height; ++y) {
-    for (int x = 0; x < width; ++x) {
-      __m64 src = _mm_cvtsi32_si64(*reinterpret_cast<const int*>(dstp + x * 4));
-      __m64 ovr = _mm_cvtsi32_si64(*reinterpret_cast<const int*>(ovrp + x * 4));
-
-      __m64 alpha = _mm_cvtsi32_si64((ovrp[x * 4 + 3] * level + 1) >> 8);
-      alpha = _mm_shuffle_pi16(alpha, _MM_SHUFFLE(0, 0, 0, 0));
-
-      src = _mm_unpacklo_pi8(src, zero);
-      ovr = _mm_unpacklo_pi8(ovr, zero);
-
-      __m64 luma;
-      if (use_chroma) {
-        luma = _mm_subs_pi16(ff, ovr);
-      }
-      else {
-        luma = calculate_luma_isse(_mm_andnot_si64(ovr, ff), rgb_coeffs, zero);
-      }
-
-      __m64 dst = _mm_subs_pi16(luma, src);
-      dst = _mm_mullo_pi16(dst, alpha);
-      dst = _mm_add_pi16(dst, rounder_simd);
-      dst = _mm_srli_pi16(dst, 8);
-      dst = _mm_add_pi8(src, dst);
-
-      dst = _mm_packs_pu16(dst, zero);
-
-      *reinterpret_cast<int*>(dstp + x * 4) = _mm_cvtsi64_si32(dst);
-    }
-    dstp += dst_pitch;
-    ovrp += overlay_pitch;
-  }
-  _mm_empty();
-}
-
-// instantiate
-template void layer_rgb32_subtract_isse<false>(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
-template void layer_rgb32_subtract_isse<true>(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
-
-#endif
-
 
 
 template<int mode>
@@ -866,69 +601,4 @@ void layer_rgb32_lighten_darken_sse2(BYTE* dstp, const BYTE* ovrp, int dst_pitch
 // instantiate
 template void layer_rgb32_lighten_darken_sse2<LIGHTEN>(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level, int thresh);
 template void layer_rgb32_lighten_darken_sse2<DARKEN>(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level, int thresh);
-
-#ifdef X86_32
-template<int mode>
-void layer_rgb32_lighten_darken_isse(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level, int thresh) {
-  __m64 zero = _mm_setzero_si64();
-  __m64 rgb_coeffs = _mm_set_pi16(0, cyr, cyg, cyb);
-  __m64 threshold = _mm_set1_pi16(thresh);
-
-  constexpr int rounder = 128;
-  const __m64 rounder_simd = _mm_set1_pi16(rounder);
-
-  for (int y = 0; y < height; ++y) {
-    for (int x = 0; x < width; ++x) {
-      __m64 src = _mm_cvtsi32_si64(*reinterpret_cast<const int*>(dstp + x * 4));
-      __m64 ovr = _mm_cvtsi32_si64(*reinterpret_cast<const int*>(ovrp + x * 4));
-
-      __m64 alpha = _mm_cvtsi32_si64((ovrp[x * 4 + 3] * level + 1) >> 8);
-      alpha = _mm_shuffle_pi16(alpha, _MM_SHUFFLE(0, 0, 0, 0));
-
-      src = _mm_unpacklo_pi8(src, zero);
-      ovr = _mm_unpacklo_pi8(ovr, zero);
-
-      __m64 luma_ovr = calculate_luma_isse(ovr, rgb_coeffs, zero);
-      __m64 luma_src = calculate_luma_isse(src, rgb_coeffs, zero);
-
-      /*
-      if constexpr (mode == LIGHTEN)
-        alpha = luma_ovr > luma_src + thresh ? alpha : 0;
-      else // DARKEN
-        alpha = luma_ovr < luma_src - thresh ? alpha : 0;
-      */
-
-      __m64 mask;
-      if (mode == LIGHTEN) {
-        __m64 tmp = _mm_add_pi16(luma_src, threshold);
-        mask = _mm_cmpgt_pi16(luma_ovr, tmp);
-      }
-      else {
-        __m64 tmp = _mm_sub_pi16(luma_src, threshold);
-        mask = _mm_cmpgt_pi16(tmp, luma_ovr);
-      }
-
-      alpha = _mm_and_si64(alpha, mask);
-
-      __m64 dst = _mm_subs_pi16(ovr, src);
-      dst = _mm_mullo_pi16(dst, alpha);
-      dst = _mm_add_pi16(dst, rounder_simd);
-      dst = _mm_srli_pi16(dst, 8);
-      dst = _mm_add_pi8(src, dst);
-
-      dst = _mm_packs_pu16(dst, zero);
-
-      *reinterpret_cast<int*>(dstp + x * 4) = _mm_cvtsi64_si32(dst);
-    }
-    dstp += dst_pitch;
-    ovrp += overlay_pitch;
-  }
-  _mm_empty();
-}
-
-// instantiate
-template void layer_rgb32_lighten_darken_isse<LIGHTEN>(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level, int thresh);
-template void layer_rgb32_lighten_darken_isse<DARKEN>(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level, int thresh);
-
-#endif
 

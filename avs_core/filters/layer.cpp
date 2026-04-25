@@ -37,6 +37,7 @@
 // Avisynth filter: Layer
 // by "poptones" (poptones@myrealbox.com)
 
+#include <avisynth.h>
 #include "layer.h"
 #ifdef INTEL_INTRINSICS
 #include "intel/layer_sse.h"
@@ -52,7 +53,6 @@
 #include <avs/posix.h>
 #endif
 
-#include <avs/minmax.h>
 #include <avs/alignment.h>
 #include "../core/internal.h"
 #include "../convert/convert_planar.h"
@@ -193,7 +193,7 @@ static void mask_planar_rgb_float_c(BYTE* dstp8, const BYTE* srcp_r8, const BYTE
 PVideoFrame __stdcall Mask::GetFrame(int n, IScriptEnvironment* env)
 {
   PVideoFrame src1 = child1->GetFrame(n, env);
-  PVideoFrame src2 = child2->GetFrame(min(n, mask_frames - 1), env);
+  PVideoFrame src2 = child2->GetFrame(std::min(n, mask_frames - 1), env);
 
   env->MakeWritable(&src1);
 
@@ -235,13 +235,6 @@ PVideoFrame __stdcall Mask::GetFrame(int n, IScriptEnvironment* env)
       mask_sse2(src1p, src2p, src1_pitch, src2_pitch, vi.width, vi.height);
     }
     else
-#ifdef X86_32
-      if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_MMX))
-      {
-        mask_mmx(src1p, src2p, src1_pitch, src2_pitch, vi.width, vi.height);
-      }
-      else
-#endif
 #endif
       {
         if (pixelsize == 1) { // RGB32
@@ -391,13 +384,6 @@ PVideoFrame __stdcall ColorKeyMask::GetFrame(int n, IScriptEnvironment* env)
       colorkeymask_sse2(pf, pitch, color, vi.height, rowsize, tolB, tolG, tolR);
     }
     else
-#ifdef X86_32
-      if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_MMX))
-      {
-        colorkeymask_mmx(pf, pitch, color, vi.height, rowsize, tolB, tolG, tolR);
-      }
-      else
-#endif
 #endif
       {
         if (pixelsize == 1) {
@@ -485,8 +471,8 @@ ResetMask::ResetMask(PClip _child, AVSValue _mask_f, AVSValue _opacity_f, IScrip
   // opacity = 0.0 means TRANSPARENT (invisible, mask value 0 : black)
   // when opacity is set, it overrides mask
 
-  mask = clamp(mask, 0, max_pixel_value);
-  mask_f = clamp(mask_f, 0.0f, 1.0f);
+  mask = std::min(std::max(mask, 0), max_pixel_value);
+  mask_f = std::min(std::max(mask_f, 0.0f), 1.0f);
 }
 
 
@@ -2317,7 +2303,7 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
 
   if (xcount <= 0 || ycount <= 0) return src1;
 
-  PVideoFrame src2 = child2->GetFrame(min(n, overlay_frames - 1), env);
+  PVideoFrame src2 = child2->GetFrame(std::min(n, overlay_frames - 1), env);
 
   env->MakeWritable(&src1);
 
@@ -2370,12 +2356,6 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
         {
           layer_rgb32_mul_sse2<true>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
         }
-#ifdef X86_32
-        else if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_INTEGER_SSE))
-        {
-          layer_rgb32_mul_isse<true>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
-        }
-#endif
         else
 #endif
         {
@@ -2396,12 +2376,6 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
         {
           layer_rgb32_mul_sse2<false>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
         }
-#ifdef X86_32
-        else if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_INTEGER_SSE))
-        {
-          layer_rgb32_mul_isse<false>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
-        }
-#endif
         else
 #endif
         {
@@ -2461,12 +2435,6 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
         {
           layer_rgb32_add_sse2<false>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
         }
-#ifdef X86_32
-        else if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_INTEGER_SSE))
-        {
-          layer_rgb32_add_isse<false>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
-        }
-#endif
         else
 #endif
         {
@@ -2491,12 +2459,6 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
       {
         layer_rgb32_lighten_darken_sse2<LIGHTEN>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel, thresh);
       }
-#ifdef X86_32
-      else if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_INTEGER_SSE))
-      {
-        layer_rgb32_lighten_darken_isse<LIGHTEN>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel, thresh);
-      }
-#endif
       else
 #endif 
       {
@@ -2520,12 +2482,6 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
       {
         layer_rgb32_lighten_darken_sse2<DARKEN>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel, thresh);
       }
-#ifdef X86_32
-      else if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_INTEGER_SSE))
-      {
-        layer_rgb32_lighten_darken_isse<DARKEN>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel, thresh);
-      }
-#endif
       else
 #endif
       {
@@ -2575,12 +2531,6 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
       {
         layer_rgb32_subtract_sse2<false>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
       }
-#ifdef X86_32
-      else if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_INTEGER_SSE))
-      {
-        layer_rgb32_subtract_isse<false>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
-      }
-#endif
       else
 #endif
       {
@@ -3088,15 +3038,15 @@ Subtract::Subtract(PClip _child1, PClip _child2, IScriptEnvironment* env)
     env->ThrowError("Subtract: image formats don't match");
 
   vi = vi1;
-  vi.num_frames = max(vi1.num_frames, vi2.num_frames);
-  vi.num_audio_samples = max(vi1.num_audio_samples, vi2.num_audio_samples);
+  vi.num_frames = std::max(vi1.num_frames, vi2.num_frames);
+  vi.num_audio_samples = std::max(vi1.num_audio_samples, vi2.num_audio_samples);
 
   pixelsize = vi.ComponentSize();
   bits_per_pixel = vi.BitsPerComponent();
 
   if (!DiffFlag) { // Init the global Diff table
     DiffFlag = true;
-    for (int i = 0; i <= 512; i++) LUT_Diff8[i] = max(0, min(255, i - 129));
+    for (int i = 0; i <= 512; i++) LUT_Diff8[i] = std::max(0, std::min(255, i - 129));
     // 0 ..  129  130 131   ... 255 256 257 258     384 ... 512
     // 0 ..   0    1   2  3 ... 126 127 128 129 ... 255 ... 255
   }
@@ -3112,11 +3062,10 @@ static void subtract_plane(BYTE* src1p, const BYTE* src2p, int src1_pitch, int s
   const limits_t equal_luma = sizeof(pixel_t) == 1 ? midpixel : sizeof(pixel_t) == 2 ? (midpixel << (bits_per_pixel - 8)) : (limits_t)(chroma ? uv8tof(midpixel) : c8tof(midpixel));
   for (int y = 0; y < height; y++) {
     for (int x = 0; x < width; x++) {
+      limits_t val = reinterpret_cast<const pixel_t*>(src2p)[x] - reinterpret_cast<const pixel_t*>(src1p)[x] + equal_luma;
+      // 126: luma of equality
       reinterpret_cast<pixel_t*>(src1p)[x] =
-        (pixel_t)clamp(
-          (limits_t)(reinterpret_cast<pixel_t*>(src1p)[x] - reinterpret_cast<const pixel_t*>(src2p)[x] + equal_luma), // 126: luma of equality
-          limit_lo,
-          limit_hi);
+        (pixel_t)std::min(std::max(val, limit_lo), limit_hi);
     }
     src1p += src1_pitch;
     src2p += src2_pitch;
