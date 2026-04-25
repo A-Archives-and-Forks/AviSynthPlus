@@ -935,7 +935,7 @@ static void adjustWriteLimits(std::vector<int>& s, const std::vector<BBX>& bbx_a
   // Fixed FONT_WIDTH calculation logic is replaced with logic which allows variable width characters
   // Starting the truncation from the right side until the last character fits into the right margin, at least one pixel of it.
   // bbx.width is the width of the character, not the whole font, this amount must be subtracted from the right margin.
-  while( total_width > vi_width - x + bbx_array[s[len - 1]].width && len > 0) {
+  while(len > 0 && total_width > vi_width - x + bbx_array[s[len - 1]].width) {
     // remove last character
     len--;
     total_width -= bbx_array[s[len]].width;
