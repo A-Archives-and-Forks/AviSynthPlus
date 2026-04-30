@@ -622,7 +622,6 @@ static void convert_uint_limited_c(const BYTE* srcp, BYTE* dstp, int src_rowsize
     const int shift_bits = source_bitdepth - target_bitdepth;
     const int round = 1 << (shift_bits - 1);
 
-    const pixel_t_d target_max = (1 << target_bitdepth) - 1;
     const pixel_t_s source_max = (1 << source_bitdepth) - 1;
 
     for (int y = 0; y < src_height; y++)
