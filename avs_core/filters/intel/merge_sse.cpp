@@ -323,6 +323,7 @@ void replace_luma_yuy2_mmx(BYTE *src, const BYTE *luma, int pitch, int luma_pitc
  *            average_plane
  * -----------------------------------
  */
+ // Can be called from Layer or Overlay, so no aligned loads/stores here and prepare for exact width
 template<typename pixel_t>
 void average_plane_sse2(BYTE *p1, const BYTE *p2, int p1_pitch, int p2_pitch, int rowsize, int height) {
   // width is RowSize here
@@ -330,15 +331,15 @@ void average_plane_sse2(BYTE *p1, const BYTE *p2, int p1_pitch, int p2_pitch, in
 
   for(int y = 0; y < height; y++) {
     for(int x = 0; x < mod16_width; x+=16) {
-      __m128i src1  = _mm_load_si128(reinterpret_cast<const __m128i*>(p1+x));
-      __m128i src2  = _mm_load_si128(reinterpret_cast<const __m128i*>(p2+x));
+      __m128i src1  = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p1+x));
+      __m128i src2  = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p2+x));
       __m128i dst;
       if constexpr(sizeof(pixel_t) == 1)
-        dst  = _mm_avg_epu8(src1, src2); // 8 pixels
+        dst = _mm_avg_epu8(src1, src2); // 8 pixels
       else // pixel_size == 2
         dst = _mm_avg_epu16(src1, src2); // 4 pixels
 
-      _mm_store_si128(reinterpret_cast<__m128i*>(p1+x), dst);
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(p1+x), dst);
     }
 
     if (mod16_width != rowsize) {
@@ -355,41 +356,6 @@ void average_plane_sse2(BYTE *p1, const BYTE *p2, int p1_pitch, int p2_pitch, in
 template void average_plane_sse2<uint8_t>(BYTE* p1, const BYTE* p2, int p1_pitch, int p2_pitch, int rowsize, int height);
 template void average_plane_sse2<uint16_t>(BYTE* p1, const BYTE* p2, int p1_pitch, int p2_pitch, int rowsize, int height);
 
-#ifdef X86_32
-template<typename pixel_t>
-void average_plane_isse(BYTE *p1, const BYTE *p2, int p1_pitch, int p2_pitch, int rowsize, int height) {
-  // width is RowSize here
-  int mod8_width = rowsize / 8 * 8;
-
-  for(int y = 0; y < height; y++) {
-    for(int x = 0; x < mod8_width; x+=8) {
-      __m64 src1 = *reinterpret_cast<const __m64*>(p1+x);
-      __m64 src2 = *reinterpret_cast<const __m64*>(p2+x);
-      __m64 dst;
-      if constexpr(sizeof(pixel_t) == 1)
-        dst = _mm_avg_pu8(src1, src2);  // 8 pixels
-      else // pixel_size == 2
-        dst = _mm_avg_pu16(src1, src2); // 4 pixels
-      *reinterpret_cast<__m64*>(p1+x) = dst;
-    }
-
-    if (mod8_width != rowsize) {
-      for (size_t x = mod8_width / sizeof(pixel_t); x < rowsize / sizeof(pixel_t); ++x) {
-        reinterpret_cast<pixel_t *>(p1)[x] = (int(reinterpret_cast<pixel_t *>(p1)[x]) + reinterpret_cast<const pixel_t *>(p2)[x] + 1) >> 1;
-      }
-    }
-    p1 += p1_pitch;
-    p2 += p2_pitch;
-  }
-  _mm_empty();
-}
-
-template void average_plane_isse<uint8_t>(BYTE* p1, const BYTE* p2, int p1_pitch, int p2_pitch, int rowsize, int height);
-template void average_plane_isse<uint16_t>(BYTE* p1, const BYTE* p2, int p1_pitch, int p2_pitch, int rowsize, int height);
-
-#endif
-
-
 // weighted_merge_planar SSE2 implementations moved to overlay/intel/blend_common_sse.cpp
 // (see weighted_merge_sse2 / weighted_merge_float_sse2)
 
@@ -400,12 +366,12 @@ void average_plane_sse2_float(BYTE *p1, const BYTE *p2, int p1_pitch, int p2_pit
 
   for (int y = 0; y < height; y++) {
     for (int x = 0; x < wMod16; x += 16) {
-      auto px1 = _mm_load_ps(reinterpret_cast<const float*>(p1 + x));
-      auto px2 = _mm_load_ps(reinterpret_cast<const float*>(p2 + x));
+      auto px1 = _mm_loadu_ps(reinterpret_cast<const float*>(p1 + x));
+      auto px2 = _mm_loadu_ps(reinterpret_cast<const float*>(p2 + x));
 
-      auto result = _mm_mul_ps(_mm_add_ps(px1, px2), OneHalf); //
+      auto result = _mm_mul_ps(_mm_add_ps(px1, px2), OneHalf);
 
-      _mm_store_ps(reinterpret_cast<float *>(p1 + x), result);
+      _mm_storeu_ps(reinterpret_cast<float *>(p1 + x), result);
     }
 
     for (size_t x = wMod16 / sizeof(float); x < rowsize / sizeof(float); x++) {

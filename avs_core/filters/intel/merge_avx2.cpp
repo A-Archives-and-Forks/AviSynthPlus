@@ -79,9 +79,9 @@
  *            average_plane
  * -----------------------------------
  */
-#define AVX2BUG_WORKAROUND
-// VS2017 15.5.1..2 optimizer generates illegal instructions for vmovntdqa
-// just a note, to be removed
+// VS2017 15.5.1..2 optimizer generates illegal instructions for _mm_stream_load_si128 (vmovntdqa)
+// just a note, don't use that.
+// Can be called from Layer or Overlay, so no aligned loads/stores here and prepare for exact width
 template<typename pixel_t>
 void average_plane_avx2(BYTE *p1, const BYTE *p2, int p1_pitch, int p2_pitch, int rowsize, int height) {
   // width is RowSize here
@@ -90,54 +90,27 @@ void average_plane_avx2(BYTE *p1, const BYTE *p2, int p1_pitch, int p2_pitch, in
 
   for(int y = 0; y < height; y++) {
     for(int x = 0; x < mod32_width; x+=32) {
-#ifdef AVX2BUG_WORKAROUND
-      __m256i src1 = _mm256_load_si256(reinterpret_cast<__m256i*>(p1 + x));
-#else
-      __m256i src1  = _mm256_stream_load_si256(reinterpret_cast<__m256i*>(p1+x));
-#endif
-      /*
-      00070	8d 40 20	 lea	 eax, DWORD PTR [eax+32]
-
-      ; 70   :       __m256i src1  = _mm256_stream_load_si256(reinterpret_cast<__m256i*>(p1+x));
-
-      00073	c5 fe 6f 40 e0	 vmovdqu ymm0, YMMWORD PTR [eax-32]
-      00078	c4 e2 7d 2a c8	 vmovntdqa ymm1, ymm0            ****CRASH HERE! ILLEGAL INSTRUCTION VS15.5.1!!!****
-
-      ; 71   :       __m256i src2  = _mm256_stream_load_si256(const_cast<__m256i*>(reinterpret_cast<const __m256i*>(p2+x)));
-
-      0007d	c5 fe 6f 44 02 e0		 vmovdqu ymm0, YMMWORD PTR [edx+eax-32]
-      00083	c4 e2 7d 2a c0	 vmovntdqa ymm0, ymm0
-
-      */
-#ifdef AVX2BUG_WORKAROUND
-      __m256i src2  = _mm256_load_si256(const_cast<__m256i*>(reinterpret_cast<const __m256i*>(p2+x)));
-      #else
-      __m256i src2 = _mm256_stream_load_si256(const_cast<__m256i*>(reinterpret_cast<const __m256i*>(p2 + x)));
-      #endif
+      __m256i src1 = _mm256_loadu_si256(reinterpret_cast<__m256i*>(p1 + x));
+      __m256i src2  = _mm256_loadu_si256(const_cast<__m256i*>(reinterpret_cast<const __m256i*>(p2+x)));
       __m256i dst;
       if constexpr(sizeof(pixel_t) == 1)
         dst  = _mm256_avg_epu8(src1, src2); // 16 pixels
       else // pixel_size == 2
         dst = _mm256_avg_epu16(src1, src2); // 8 pixels
 
-      _mm256_store_si256(reinterpret_cast<__m256i*>(p1+x), dst);
+      _mm256_storeu_si256(reinterpret_cast<__m256i*>(p1+x), dst);
     }
 
     for(int x = mod32_width; x < mod16_width; x+=16) {
-#ifdef AVX2BUG_WORKAROUND
-      __m128i src1 = _mm_load_si128(reinterpret_cast<__m128i*>(p1 + x));
-      __m128i src2 = _mm_load_si128(const_cast<__m128i*>(reinterpret_cast<const __m128i*>(p2 + x)));
-#else
-      __m128i src1  = _mm_stream_load_si128(reinterpret_cast<__m128i*>(p1+x));
-      __m128i src2  = _mm_stream_load_si128(const_cast<__m128i*>(reinterpret_cast<const __m128i*>(p2+x)));
-#endif
+      __m128i src1 = _mm_loadu_si128(reinterpret_cast<__m128i*>(p1 + x));
+      __m128i src2 = _mm_loadu_si128(const_cast<__m128i*>(reinterpret_cast<const __m128i*>(p2 + x)));
       __m128i dst;
       if constexpr(sizeof(pixel_t) == 1)
         dst  = _mm_avg_epu8(src1, src2); // 8 pixels
       else // pixel_size == 2
         dst = _mm_avg_epu16(src1, src2); // 4 pixels
 
-      _mm_store_si128(reinterpret_cast<__m128i*>(p1+x), dst);
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(p1+x), dst);
     }
 
     if (mod16_width != rowsize) {
@@ -154,6 +127,51 @@ void average_plane_avx2(BYTE *p1, const BYTE *p2, int p1_pitch, int p2_pitch, in
 template void average_plane_avx2<uint8_t>(BYTE *p1, const BYTE *p2, int p1_pitch, int p2_pitch, int rowsize, int height);
 template void average_plane_avx2<uint16_t>(BYTE *p1, const BYTE *p2, int p1_pitch, int p2_pitch, int rowsize, int height);
 
-
 // weighted_merge_planar AVX2 implementations moved to overlay/intel/blend_common_avx2.cpp
 // (see weighted_merge_avx2 / weighted_merge_float_avx2)
+
+void average_plane_avx2_float(BYTE* p1, const BYTE* p2, int p1_pitch, int p2_pitch, int rowsize, int height) {
+  const auto v_half = _mm256_set1_ps(0.5f);
+
+  // Process 64 bytes (16 floats) per iteration
+  const int wMod64 = (rowsize / 64) * 64;
+  // Process 32 bytes (8 floats) per iteration (for the remainder)
+  const int wMod32 = (rowsize / 32) * 32;
+
+  for (int y = 0; y < height; y++) {
+    int x = 0;
+
+    // 16 floats at a time
+    for (; x < wMod64; x += 64) {
+      // Load 16 floats from p1 and 16 from p2
+      auto p1_a = _mm256_loadu_ps(reinterpret_cast<const float*>(p1 + x));
+      auto p1_b = _mm256_loadu_ps(reinterpret_cast<const float*>(p1 + x + 32));
+      auto p2_a = _mm256_loadu_ps(reinterpret_cast<const float*>(p2 + x));
+      auto p2_b = _mm256_loadu_ps(reinterpret_cast<const float*>(p2 + x + 32));
+
+      // result = (p1 + p2) * 0.5
+      auto res_a = _mm256_mul_ps(_mm256_add_ps(p1_a, p2_a), v_half);
+      auto res_b = _mm256_mul_ps(_mm256_add_ps(p1_b, p2_b), v_half);
+
+      _mm256_storeu_ps(reinterpret_cast<float*>(p1 + x), res_a);
+      _mm256_storeu_ps(reinterpret_cast<float*>(p1 + x + 32), res_b);
+    }
+
+    // 8 floats at a time
+    for (; x < wMod32; x += 32) {
+      auto px1 = _mm256_loadu_ps(reinterpret_cast<const float*>(p1 + x));
+      auto px2 = _mm256_loadu_ps(reinterpret_cast<const float*>(p2 + x));
+      auto res = _mm256_mul_ps(_mm256_add_ps(px1, px2), v_half);
+      _mm256_storeu_ps(reinterpret_cast<float*>(p1 + x), res);
+    }
+
+    // Scalar tail widths
+    for (int i = x / 4; i < rowsize / 4; i++) {
+      reinterpret_cast<float*>(p1)[i] = (reinterpret_cast<float*>(p1)[i] + reinterpret_cast<const float*>(p2)[i]) * 0.5f;
+    }
+
+    p1 += p1_pitch;
+    p2 += p2_pitch;
+  }
+}
+

@@ -60,10 +60,6 @@ void replace_luma_yuy2_mmx(BYTE* src, const BYTE* luma, int pitch, int luma_pitc
 #endif
 void replace_luma_yuy2_sse2(BYTE* src, const BYTE* luma, int pitch, int luma_pitch, int width, int height);
 
-#ifdef X86_32
-template<typename pixel_t>
-void average_plane_isse(BYTE* p1, const BYTE* p2, int p1_pitch, int p2_pitch, int rowsize, int height);
-#endif
 template<typename pixel_t>
 void average_plane_sse2(BYTE* p1, const BYTE* p2, int p1_pitch, int p2_pitch, int rowsize, int height);
 void average_plane_sse2_float(BYTE* p1, const BYTE* p2, int p1_pitch, int p2_pitch, int rowsize, int height);

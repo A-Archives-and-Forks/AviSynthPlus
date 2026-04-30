@@ -139,14 +139,21 @@ extern const AVSFunction Merge_filters[] = {
   { 0 }
 };
 
-static void merge_plane(BYTE* srcp, const BYTE* otherp, int src_pitch, int other_pitch, int src_rowsize, int src_height, float weight, int pixelsize, int bits_per_pixel, IScriptEnvironment* env) {
-  // Use fast average path when weight rounds to exactly half in the SIMD integer scale (0..32767).
-  // For float clips check exact 0.5f; for integer clips check the two adjacent integers around 16383.5.
-  // (0.5 * 32767 + 0.5 == 16384 => weight_i_simd == 16384, invweight_i == 16383)
-  const int weight_i_simd = (bits_per_pixel != 32) ? (int)(weight * 32767.0f + 0.5f) : 0;
-  const bool use_average = (bits_per_pixel == 32)
-    ? (weight == 0.5f)
-    : (weight_i_simd == 16383 || weight_i_simd == 16384);
+void merge_plane(BYTE* srcp, const BYTE* otherp, int src_pitch, int other_pitch, int src_rowsize, int src_height, float weight, int bits_per_pixel, bool use_padded_width, IScriptEnvironment* env) {
+
+  if (use_padded_width) {
+    // Align the width to the next multiple of FRAME_ALIGN (64) bytes, which is the alignment used for AviSynth+ frame buffers.
+    // This allows SIMD kernels to process the entire row without a scalar tail, improving performance for full-frame merges.
+    src_rowsize = AlignNumber(src_rowsize, FRAME_ALIGN);
+  }
+
+  // 15 bit arithmetic for integer weighted merge: weight is in [0..32768], invweight = 32768 - weight.
+  const int weight_i = (int)(weight * 32768.0f + 0.5f);
+  const int invweight_i = 32768 - weight_i;
+
+  const int pixelsize = bits_per_pixel == 8 ? 1 : (bits_per_pixel <= 16 ? 2 : 4);
+
+  const bool use_average = (bits_per_pixel == 32) ? (weight == 0.5f) : (weight_i == 16384);
   if (use_average)
   {
     //average of two planes
@@ -166,15 +173,6 @@ static void merge_plane(BYTE* srcp, const BYTE* otherp, int src_pitch, int other
           average_plane_sse2<uint16_t>(srcp, otherp, src_pitch, other_pitch, src_rowsize, src_height);
       }
       else
-#ifdef X86_32
-        if (env->GetCPUFlags() & CPUF_INTEGER_SSE) {
-          if (pixelsize == 1)
-            average_plane_isse<uint8_t>(srcp, otherp, src_pitch, other_pitch, src_rowsize, src_height);
-          else // pixel_size==2
-            average_plane_isse<uint16_t>(srcp, otherp, src_pitch, other_pitch, src_rowsize, src_height);
-        }
-        else
-#endif
 #endif
         {
           if (pixelsize == 1)
@@ -185,7 +183,9 @@ static void merge_plane(BYTE* srcp, const BYTE* otherp, int src_pitch, int other
     }
     else { // if (pixelsize == 4)
 #ifdef INTEL_INTRINSICS
-      if (env->GetCPUFlags() & CPUF_SSE2)
+      if (env->GetCPUFlags() & CPUF_AVX2)
+        average_plane_avx2_float(srcp, otherp, src_pitch, other_pitch, src_rowsize, src_height);
+      else if (env->GetCPUFlags() & CPUF_SSE2)
         average_plane_sse2_float(srcp, otherp, src_pitch, other_pitch, src_rowsize, src_height);
       else
 #endif
