@@ -536,7 +536,7 @@ public:
       _mm256_storeu_ps((float*)&result.raw(), _mm256_loadu_ps(ptr));
 #else
       __m128i tmp1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ptr));
-      __m128i tmp1next16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ptr + 16));
+      __m128i tmp1next16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ptr + 4));
       memcpy(&result.data, &tmp1, 16);
       memcpy(reinterpret_cast<char*>(&result.data) + 16, &tmp1next16, 16);
 #endif
