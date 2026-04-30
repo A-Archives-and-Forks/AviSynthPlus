@@ -13,8 +13,8 @@
 #include <stdint.h>
 #include "../layer.h"   // layer_yuv_add_c_t, layer_yuv_add_f_c_t
 
-void get_layer_yuv_add_functions_sse41(
-  bool is_chroma, bool use_chroma, bool hasAlpha,
+void get_layer_yuv_masked_add_functions_sse41(
+  bool is_chroma,
   int placement, VideoInfo& vi, int bits_per_pixel,
   layer_yuv_add_c_t** layer_fn,
   layer_yuv_add_f_c_t** layer_f_fn);

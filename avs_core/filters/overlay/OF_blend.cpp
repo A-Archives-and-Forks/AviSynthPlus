@@ -54,7 +54,6 @@
 // ---------------------------------------------------------------------------
 
 // Float masked blend — placement-aware, parallel structure to the integer getter.
-// SIMD float kernels only implement MASK444; non-MASK444 chroma falls back to C.
 // is_lumamask_based_chroma=false → always MASK444 (luma).  is_lumamask_based_chroma=true → placement-aware.
 // Note that when we use an exactly calculated and sized chroma mask, which is actually
 // in 1:1 relation with the chroma plane, then is_lumamask_based_chroma=false must be given here.
@@ -71,19 +70,14 @@ static masked_merge_float_fn_t* get_overlay_blend_masked_float_fn(
       maskMode = (placement == PLACEMENT_MPEG1) ? MASK422 : (placement == PLACEMENT_TOPLEFT) ? MASK422_TOPLEFT : MASK422_MPEG2;
   }
 
-  // SIMD float kernels only have MASK444 implementations — use them when maskMode allows.
-  if (maskMode == MASK444) {
 #ifdef INTEL_INTRINSICS
-    // FIXME: use get_overlay_blend_masked_float_fn_avx2(is_lumamask_based_chroma, maskMode);
-    if (cpuFlags & CPUF_AVX2) return &masked_merge_float_avx2;
-    // FIXME: use get_overlay_blend_masked_float_fn_sse2(is_lumamask_based_chroma, maskMode);
-    if (cpuFlags & CPUF_SSE2) return &masked_merge_float_sse2;
+  if (cpuFlags & CPUF_AVX2)   return get_overlay_blend_masked_float_fn_avx2(is_lumamask_based_chroma, maskMode);
+  if (cpuFlags & CPUF_SSE4_1) return get_overlay_blend_masked_float_fn_sse41(is_lumamask_based_chroma, maskMode);
+  if ((cpuFlags & CPUF_SSE2) && maskMode == MASK444) return &masked_merge_float_sse2;
 #endif
 #ifdef NEON_INTRINSICS
-    if (cpuFlags & CPUF_ARM_NEON) return &masked_merge_float_neon;
+  if (cpuFlags & CPUF_ARM_NEON) return get_overlay_blend_masked_float_fn_neon(is_lumamask_based_chroma, maskMode);
 #endif
-  }
-  // Non-MASK444 chroma (or no SIMD): C fallback with correct placement.
   return get_overlay_blend_masked_float_fn_c(is_lumamask_based_chroma, maskMode);
 }
 
@@ -125,6 +119,11 @@ static void overlay_blend_neon_weighted_wrap(
   const int bits_per_pixel)
 {
   const int weight = static_cast<int>(opacity_f * 32768 + 0.5f);
+  if (weight == 0 || weight == 32768) {
+    // Avoid calling the full weighted_merge when one of the weights is zero, in case of no early out
+    weighted_merge_return_a_or_b(p1, p2, p1_pitch, p2_pitch, width, height, weight, 32768 - weight, bits_per_pixel);
+    return;
+  }
   weighted_merge_neon(p1, p2, p1_pitch, p2_pitch, width, height, weight, 32768 - weight, bits_per_pixel);
 }
 
@@ -146,6 +145,11 @@ static void overlay_blend_weighted_avx2(
   const int bits_per_pixel)
 {
   const int weight = static_cast<int>(opacity_f * 32768 + 0.5f);
+  if (weight == 0 || weight == 32768) {
+    // Avoid calling the full weighted_merge when one of the weights is zero, in case of no early out
+    weighted_merge_return_a_or_b(p1, p2, p1_pitch, p2_pitch, width, height, weight, 32768 - weight, bits_per_pixel);
+    return;
+  }
   weighted_merge_avx2(p1, p2, p1_pitch, p2_pitch, width, height, weight, 32768 - weight, bits_per_pixel);
 }
 
@@ -156,6 +160,11 @@ static void overlay_blend_weighted_sse2(
   const int bits_per_pixel)
 {
   const int weight = static_cast<int>(opacity_f * 32768 + 0.5f);
+  if (weight == 0 || weight == 32768) {
+    // Avoid calling the full weighted_merge when one of the weights is zero, in case of no early out
+    weighted_merge_return_a_or_b(p1, p2, p1_pitch, p2_pitch, width, height, weight, 32768 - weight, bits_per_pixel);
+    return;
+  }
   weighted_merge_sse2(p1, p2, p1_pitch, p2_pitch, width, height, weight, 32768 - weight, bits_per_pixel);
 }
 
@@ -187,6 +196,11 @@ static void overlay_blend_weighted_c(
   const int bits_per_pixel)
 {
   const int weight = static_cast<int>(opacity_f * 32768 + 0.5f);
+  if (weight == 0 || weight == 32768) {
+    // Avoid calling the full weighted_merge_c when one of the weights is zero, in case of no early out
+    weighted_merge_return_a_or_b(p1, p2, p1_pitch, p2_pitch, width, height, weight, 32768 - weight, bits_per_pixel);
+    return;
+  }
   weighted_merge_c(p1, p2, p1_pitch, p2_pitch, width, height, weight, 32768 - weight, bits_per_pixel);
 }
 
@@ -237,19 +251,19 @@ static void do_fill_chroma_row_f(
 {
   switch (mode) {
   case MASK411:
-    prepare_effective_mask_for_row_f<MASK411,          full_opacity>(luma_row, luma_pitch_floats, chroma_w, buf, opacity_f); break;
+    prepare_effective_mask_for_row_float_c<MASK411,          full_opacity>(luma_row, luma_pitch_floats, chroma_w, buf, opacity_f); break;
   case MASK420:
-    prepare_effective_mask_for_row_f<MASK420,          full_opacity>(luma_row, luma_pitch_floats, chroma_w, buf, opacity_f); break;
+    prepare_effective_mask_for_row_float_c<MASK420,          full_opacity>(luma_row, luma_pitch_floats, chroma_w, buf, opacity_f); break;
   case MASK420_MPEG2:
-    prepare_effective_mask_for_row_f<MASK420_MPEG2,    full_opacity>(luma_row, luma_pitch_floats, chroma_w, buf, opacity_f); break;
+    prepare_effective_mask_for_row_float_c<MASK420_MPEG2,    full_opacity>(luma_row, luma_pitch_floats, chroma_w, buf, opacity_f); break;
   case MASK420_TOPLEFT:
-    prepare_effective_mask_for_row_f<MASK420_TOPLEFT,  full_opacity>(luma_row, luma_pitch_floats, chroma_w, buf, opacity_f); break;
+    prepare_effective_mask_for_row_float_c<MASK420_TOPLEFT,  full_opacity>(luma_row, luma_pitch_floats, chroma_w, buf, opacity_f); break;
   case MASK422:
-    prepare_effective_mask_for_row_f<MASK422,          full_opacity>(luma_row, luma_pitch_floats, chroma_w, buf, opacity_f); break;
+    prepare_effective_mask_for_row_float_c<MASK422,          full_opacity>(luma_row, luma_pitch_floats, chroma_w, buf, opacity_f); break;
   case MASK422_MPEG2:
-    prepare_effective_mask_for_row_f<MASK422_MPEG2,    full_opacity>(luma_row, luma_pitch_floats, chroma_w, buf, opacity_f); break;
+    prepare_effective_mask_for_row_float_c<MASK422_MPEG2,    full_opacity>(luma_row, luma_pitch_floats, chroma_w, buf, opacity_f); break;
   case MASK422_TOPLEFT:
-    prepare_effective_mask_for_row_f<MASK422_TOPLEFT,  full_opacity>(luma_row, luma_pitch_floats, chroma_w, buf, opacity_f); break;
+    prepare_effective_mask_for_row_float_c<MASK422_TOPLEFT,  full_opacity>(luma_row, luma_pitch_floats, chroma_w, buf, opacity_f); break;
   default: break;
   }
 }
@@ -361,12 +375,41 @@ void OL_BlendImage::BlendImageMask(ImageOverlayInternal* base, ImageOverlayInter
 
         const float* lmask = reinterpret_cast<const float*>(mask->GetPtrByIndex(0));
         const bool chroma_full_opacity = (opacity_f == 1.0f);
+#ifdef INTEL_INTRINSICS
+        const bool use_avx2_rowprep_f  = (cpuFlags & CPUF_AVX2)   != 0;
+        const bool use_sse41_rowprep_f = (cpuFlags & CPUF_SSE4_1) != 0;
+#endif
+#ifdef NEON_INTRINSICS
+        const bool use_neon_rowprep_f = (cpuFlags & CPUF_ARM_NEON) != 0;
+#endif
         for (int y = 0; y < chroma_h; y++) {
           // Fill scratch once for this luma-mask row pair, baking opacity in.
-          if (chroma_full_opacity)
-            do_fill_chroma_row_f<true> (scratch, lmask, luma_mask_pitch_floats, chroma_w, chroma_maskMode);
-          else
-            do_fill_chroma_row_f<false>(scratch, lmask, luma_mask_pitch_floats, chroma_w, chroma_maskMode, opacity_f);
+#ifdef INTEL_INTRINSICS
+          if (use_avx2_rowprep_f) {
+            if (chroma_full_opacity)
+              do_fill_chroma_row_float_avx2<true> (scratch, lmask, luma_mask_pitch_floats, chroma_w, chroma_maskMode);
+            else
+              do_fill_chroma_row_float_avx2<false>(scratch, lmask, luma_mask_pitch_floats, chroma_w, chroma_maskMode, opacity_f);
+          } else if (use_sse41_rowprep_f) {
+            if (chroma_full_opacity)
+              do_fill_chroma_row_float_sse41<true> (scratch, lmask, luma_mask_pitch_floats, chroma_w, chroma_maskMode);
+            else
+              do_fill_chroma_row_float_sse41<false>(scratch, lmask, luma_mask_pitch_floats, chroma_w, chroma_maskMode, opacity_f);
+          } else
+#elif defined(NEON_INTRINSICS)
+          if (use_neon_rowprep_f) {
+            if (chroma_full_opacity)
+              do_fill_chroma_row_float_neon<true>(scratch, lmask, luma_mask_pitch_floats, chroma_w, chroma_maskMode);
+            else
+              do_fill_chroma_row_float_neon<false>(scratch, lmask, luma_mask_pitch_floats, chroma_w, chroma_maskMode, opacity_f);
+          } else
+#endif
+          {
+            if (chroma_full_opacity)
+              do_fill_chroma_row_f<true> (scratch, lmask, luma_mask_pitch_floats, chroma_w, chroma_maskMode);
+            else
+              do_fill_chroma_row_f<false>(scratch, lmask, luma_mask_pitch_floats, chroma_w, chroma_maskMode, opacity_f);
+          }
           // Apply to each active chroma plane; opacity already baked — pass 1.0f.
           for (int i = 0; i < n_planes; i++) {
             blend_fn_luma(basep[i], ovlp[i], (const BYTE*)scratch.data(),
@@ -439,6 +482,10 @@ void OL_BlendImage::BlendImageMask(ImageOverlayInternal* base, ImageOverlayInter
         const bool use_avx2_rowprep  = (cpuFlags & CPUF_AVX2)   != 0;
         const bool use_sse41_rowprep = (cpuFlags & CPUF_SSE4_1) != 0;
 #endif
+#ifdef NEON_INTRINSICS
+        const bool use_neon_rowprep = (cpuFlags & CPUF_ARM_NEON) != 0;
+#endif
+
         for (int y = 0; y < chroma_h; y++) {
           // Fill scratch once for this luma-mask row pair, baking opacity in.
 #ifdef INTEL_INTRINSICS
@@ -453,6 +500,14 @@ void OL_BlendImage::BlendImageMask(ImageOverlayInternal* base, ImageOverlayInter
             else
               do_fill_chroma_row_sse41<pixel_t, false>(scratch, lmask, luma_mask_pitch_pixels, chroma_w, chroma_maskMode, opacity_i, half_val, mag);
           } else
+#elif defined(NEON_INTRINSICS)
+          if (use_neon_rowprep) {
+            if (chroma_full_opacity)
+              do_fill_chroma_row_neon<pixel_t, true>(scratch, lmask, luma_mask_pitch_pixels, chroma_w, chroma_maskMode);
+            else
+              do_fill_chroma_row_neon<pixel_t, false>(scratch, lmask, luma_mask_pitch_pixels, chroma_w, chroma_maskMode, opacity_i, half_val, mag);
+          }
+          else
 #endif
           {
             if (chroma_full_opacity)
@@ -508,6 +563,7 @@ void OL_BlendImage::BlendImage(ImageOverlayInternal* base, ImageOverlayInternal*
     planeindex_to = 2;
   }
 
+  // opacity == 0 was also an early-out case
   if (opacity == 256) {
     for (int p = planeindex_from; p <= planeindex_to; p++) {
       env->BitBlt(base->GetPtrByIndex(p), base->GetPitchByIndex(p), overlay->GetPtrByIndex(p), overlay->GetPitchByIndex(p), (w >> base->xSubSamplingShifts[p]) * pixelsize, h >> base->ySubSamplingShifts[p]);

@@ -52,16 +52,10 @@ const pixel_t* prepare_effective_mask_for_row_sse41(
   int half = 0,
   MagicDiv magic = {});
 
-// ---------------------------------------------------------------------------
-// prepare_effective_mask_for_row_level_baked_sse41
-// Layer-style baking: result = (avg * level + 1) >> bits_per_pixel.
-// Declared here; defined + explicitly instantiated in masked_rowprep_sse41.cpp.
-// ---------------------------------------------------------------------------
-template<MaskMode maskMode, typename pixel_t, bool full_opacity = false>
-const pixel_t* prepare_effective_mask_for_row_level_baked_sse41(
-  const pixel_t* maskp,
+template<MaskMode maskMode, bool full_opacity = true>
+const float* prepare_effective_mask_for_row_float_sse41(
+  const float* maskp,
   int mask_pitch,
   int width,
-  std::vector<pixel_t>& buf,
-  int level = 0,
-  int bits_per_pixel = 8);
+  std::vector<float>& buf,
+  float opacity = 0);

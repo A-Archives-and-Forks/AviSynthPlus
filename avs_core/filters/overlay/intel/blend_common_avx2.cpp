@@ -51,55 +51,12 @@
 // (implementation-include, no guards — each TU gets its own compiled copy)
 #include "masked_merge_avx2_impl.hpp"
 
-
-
-void masked_merge_float_avx2(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  int p1_pitch, int p2_pitch, int mask_pitch,
-  int width, int height, float opacity_f)
-{
-  const int realwidth = width * sizeof(float);
-  const int wMod32 = (realwidth / 32) * 32;
-  const __m256 opacity_v = _mm256_set1_ps(opacity_f);
-
-  for (int y = 0; y < height; y++) {
-    for (int x = 0; x < wMod32; x += 32) {
-      const __m256 p1_f   = _mm256_loadu_ps(reinterpret_cast<const float*>(p1 + x));
-      const __m256 p2_f   = _mm256_loadu_ps(reinterpret_cast<const float*>(p2 + x));
-      const __m256 mask_f = _mm256_mul_ps(_mm256_loadu_ps(reinterpret_cast<const float*>(mask + x)), opacity_v);
-      // p1*(1-m) + p2*m  =  p1 + (p2-p1)*m
-      _mm256_storeu_ps(reinterpret_cast<float*>(p1 + x),
-        _mm256_add_ps(p1_f, _mm256_mul_ps(_mm256_sub_ps(p2_f, p1_f), mask_f)));
-    }
-    for (int x = wMod32 / (int)sizeof(float); x < width; x++) {
-      const float m  = reinterpret_cast<const float*>(mask)[x] * opacity_f;
-      const float a  = reinterpret_cast<float*>(p1)[x];
-      const float b  = reinterpret_cast<const float*>(p2)[x];
-      reinterpret_cast<float*>(p1)[x] = a + (b - a) * m;
-    }
-    p1   += p1_pitch;
-    p2   += p2_pitch;
-    mask += mask_pitch;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Public Overlay API — fixed MASK444 (mask already at plane resolution).
-// Used for the normal (non-scratch) Overlay path where the mask is at chroma resolution.
-// ---------------------------------------------------------------------------
-
-void masked_merge_avx2(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  int p1_pitch, int p2_pitch, int mask_pitch,
-  int width, int height, int opacity, int bits_per_pixel)
-{
-  masked_merge_avx2_impl<MASK444>(p1, p2, mask, p1_pitch, p2_pitch, mask_pitch,
-    width, height, opacity, bits_per_pixel);
-}
-
 // ---------------------------------------------------------------------------
 // Family 1: weighted_merge — AVX2 (no mask, flat weight, >> 15 shift)
 // weight + invweight == 32768; boundary values (0, 32768) are caller early-outs.
 // ---------------------------------------------------------------------------
-
+// Important: the two extremes 0 and 32768 (15 bit arith) are handled specially earlier, returning
+// exactly data from p1 or p2 respectively. (32768 mask value does not fit into signed int16)
 static void weighted_merge_uint8_avx2_impl(
   BYTE* p1, const BYTE* p2, int p1_pitch, int p2_pitch,
   int rowsize, int height, int weight_i, int invweight_i)
@@ -184,7 +141,9 @@ static void weighted_merge_uint8_avx2_impl(
   }
 }
 
-// lessthan16bit=true:  10/12/14-bit — no signed pivot needed (values fit positive int16)
+// Important: the two extremes 0 and 32768 (15 bit arith) are handled specially earlier, returning
+// exactly data from p1 or p2 respectively. (32768 mask value does not fit into signed int16)
+// lessthan16bit=true:  10/12/14-bit — no signed pivot needed (pixel values fit positive int16)
 // lessthan16bit=false: full 16-bit  — signed pivot to avoid unsigned overflow in madd
 template<bool lessthan16bit>
 static void weighted_merge_uint16_avx2_impl(
@@ -292,6 +251,7 @@ void weighted_merge_float_avx2(BYTE* p1, const BYTE* p2, int p1_pitch, int p2_pi
 {
   const float invweight_f = 1.0f - weight_f;
   const auto  v_weight    = _mm256_set1_ps(weight_f);
+  const auto  v_invweight = _mm256_set1_ps(invweight_f);
   const int   rowsize     = width * 4;
   const int   wMod32      = (rowsize / 32) * 32;
 
@@ -300,8 +260,10 @@ void weighted_merge_float_avx2(BYTE* p1, const BYTE* p2, int p1_pitch, int p2_pi
       auto px1 = _mm256_loadu_ps(reinterpret_cast<const float*>(p1 + x));
       auto px2 = _mm256_loadu_ps(reinterpret_cast<const float*>(p2 + x));
       // p1 + (p2 - p1) * w  ==  p1*(1-w) + p2*w
-      _mm256_storeu_ps(reinterpret_cast<float*>(p1 + x),
-        _mm256_add_ps(px1, _mm256_mul_ps(_mm256_sub_ps(px2, px1), v_weight)));
+      // choose the latter to match C ref
+      auto res = _mm256_fmadd_ps(px1, v_invweight, _mm256_mul_ps(px2, v_weight));
+      // Linear interp: auto res = _mm256_add_ps(px1, _mm256_mul_ps(_mm256_sub_ps(px2, px1), v_weight))
+      _mm256_storeu_ps(reinterpret_cast<float*>(p1 + x), res);
     }
     // Scalar tail
     for (int x = wMod32 / 4; x < width; ++x) {
@@ -316,8 +278,8 @@ void weighted_merge_float_avx2(BYTE* p1, const BYTE* p2, int p1_pitch, int p2_pi
 
 // ---------------------------------------------------------------------------
 // Overlay blend masked getter — returns masked_merge_avx2_impl instantiation.
-// is_chroma=false → always MASK444 (luma).
-// is_chroma=true  → placement-aware maskMode (chroma).
+// is_chroma=false -> always MASK444 (luma).
+// is_chroma=true  -> placement-aware maskMode (chroma).
 // ---------------------------------------------------------------------------
 masked_merge_fn_t* get_overlay_blend_masked_fn_avx2(bool is_chroma, MaskMode maskMode)
 {
@@ -339,8 +301,6 @@ masked_merge_fn_t* get_overlay_blend_masked_fn_avx2(bool is_chroma, MaskMode mas
   return masked_merge_avx2_impl<MASK444>; // unreachable
 }
 
-// Layer AVX2 dispatcher has moved to filters/intel/layer_avx2.cpp.
-
 // ---------------------------------------------------------------------------
 // Per-row chroma mask preparation for the scratch path in OF_blend.cpp.
 // Defined here so masked_rowprep_avx2.hpp is only included in this TU.
@@ -353,25 +313,75 @@ void do_fill_chroma_row_avx2(
 {
   switch (mode) {
   case MASK411:
-    prepare_effective_mask_for_row_avx2<MASK411,          pixel_t, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity_i, half, magic); break;
+    prepare_effective_mask_for_row_avx2<MASK411, pixel_t, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity_i, half, magic); break;
   case MASK420:
-    prepare_effective_mask_for_row_avx2<MASK420,          pixel_t, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity_i, half, magic); break;
+    prepare_effective_mask_for_row_avx2<MASK420, pixel_t, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity_i, half, magic); break;
   case MASK420_MPEG2:
-    prepare_effective_mask_for_row_avx2<MASK420_MPEG2,    pixel_t, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity_i, half, magic); break;
+    prepare_effective_mask_for_row_avx2<MASK420_MPEG2, pixel_t, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity_i, half, magic); break;
   case MASK420_TOPLEFT:
-    prepare_effective_mask_for_row_avx2<MASK420_TOPLEFT,  pixel_t, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity_i, half, magic); break;
+    prepare_effective_mask_for_row_avx2<MASK420_TOPLEFT, pixel_t, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity_i, half, magic); break;
   case MASK422:
-    prepare_effective_mask_for_row_avx2<MASK422,          pixel_t, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity_i, half, magic); break;
+    prepare_effective_mask_for_row_avx2<MASK422, pixel_t, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity_i, half, magic); break;
   case MASK422_MPEG2:
-    prepare_effective_mask_for_row_avx2<MASK422_MPEG2,    pixel_t, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity_i, half, magic); break;
+    prepare_effective_mask_for_row_avx2<MASK422_MPEG2, pixel_t, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity_i, half, magic); break;
   case MASK422_TOPLEFT:
-    prepare_effective_mask_for_row_avx2<MASK422_TOPLEFT,  pixel_t, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity_i, half, magic); break;
+    prepare_effective_mask_for_row_avx2<MASK422_TOPLEFT, pixel_t, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity_i, half, magic); break;
   default: break;
   }
 }
 
-template void do_fill_chroma_row_avx2<uint8_t,  true> (std::vector<uint8_t>&,  const uint8_t*,  int, int, MaskMode, int, int, MagicDiv);
-template void do_fill_chroma_row_avx2<uint8_t,  false>(std::vector<uint8_t>&,  const uint8_t*,  int, int, MaskMode, int, int, MagicDiv);
-template void do_fill_chroma_row_avx2<uint16_t, true> (std::vector<uint16_t>&, const uint16_t*, int, int, MaskMode, int, int, MagicDiv);
+template void do_fill_chroma_row_avx2<uint8_t, true>(std::vector<uint8_t>&, const uint8_t*, int, int, MaskMode, int, int, MagicDiv);
+template void do_fill_chroma_row_avx2<uint8_t, false>(std::vector<uint8_t>&, const uint8_t*, int, int, MaskMode, int, int, MagicDiv);
+template void do_fill_chroma_row_avx2<uint16_t, true>(std::vector<uint16_t>&, const uint16_t*, int, int, MaskMode, int, int, MagicDiv);
 template void do_fill_chroma_row_avx2<uint16_t, false>(std::vector<uint16_t>&, const uint16_t*, int, int, MaskMode, int, int, MagicDiv);
+
+
+template<bool full_opacity>
+void do_fill_chroma_row_float_avx2(
+  std::vector<float>& buf, const float* luma_row,
+  int luma_pitch_pixels, int chroma_w, MaskMode mode,
+  float opacity)
+{
+  switch (mode) {
+  case MASK411:
+    prepare_effective_mask_for_row_float_avx2<MASK411,          full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity); break;
+  case MASK420:
+    prepare_effective_mask_for_row_float_avx2<MASK420,          full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity); break;
+  case MASK420_MPEG2:
+    prepare_effective_mask_for_row_float_avx2<MASK420_MPEG2,    full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity); break;
+  case MASK420_TOPLEFT:
+    prepare_effective_mask_for_row_float_avx2<MASK420_TOPLEFT,  full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity); break;
+  case MASK422:
+    prepare_effective_mask_for_row_float_avx2<MASK422,          full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity); break;
+  case MASK422_MPEG2:
+    prepare_effective_mask_for_row_float_avx2<MASK422_MPEG2,    full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity); break;
+  case MASK422_TOPLEFT:
+    prepare_effective_mask_for_row_float_avx2<MASK422_TOPLEFT,  full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity); break;
+  default: break;
+  }
+}
+
+template void do_fill_chroma_row_float_avx2<true> (std::vector<float>&,  const float*,  int, int, MaskMode, float);
+template void do_fill_chroma_row_float_avx2<false>(std::vector<float>&,  const float*,  int, int, MaskMode, float);
+
+// and for float:
+masked_merge_float_fn_t* get_overlay_blend_masked_float_fn_avx2(bool is_chroma, MaskMode maskMode)
+{
+#define DISPATCH_OVERLAY_BLEND_FLOAT_AVX2(MaskType) \
+  return is_chroma ? masked_merge_float_avx2_impl<MaskType> \
+                   : masked_merge_float_avx2_impl<MASK444>;
+
+  switch (maskMode) {
+  case MASK444:          DISPATCH_OVERLAY_BLEND_FLOAT_AVX2(MASK444)
+  case MASK420:          DISPATCH_OVERLAY_BLEND_FLOAT_AVX2(MASK420)
+  case MASK420_MPEG2:    DISPATCH_OVERLAY_BLEND_FLOAT_AVX2(MASK420_MPEG2)
+  case MASK420_TOPLEFT:  DISPATCH_OVERLAY_BLEND_FLOAT_AVX2(MASK420_TOPLEFT)
+  case MASK422:          DISPATCH_OVERLAY_BLEND_FLOAT_AVX2(MASK422)
+  case MASK422_MPEG2:    DISPATCH_OVERLAY_BLEND_FLOAT_AVX2(MASK422_MPEG2)
+  case MASK422_TOPLEFT:  DISPATCH_OVERLAY_BLEND_FLOAT_AVX2(MASK422_TOPLEFT)
+  case MASK411:          DISPATCH_OVERLAY_BLEND_FLOAT_AVX2(MASK411)
+  }
+#undef DISPATCH_OVERLAY_BLEND_FLOAT_AVX2
+  return masked_merge_float_avx2_impl<MASK444>; // unreachable
+}
 

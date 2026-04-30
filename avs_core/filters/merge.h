@@ -126,6 +126,8 @@ private:
   int bits_per_pixel;
 };
 
+void merge_plane(BYTE* srcp, const BYTE* otherp, int src_pitch, int other_pitch, int src_rowsize, int src_height, float weight, int bits_per_pixel, bool use_padded_width, IScriptEnvironment* env);
+
 // Dispatch helpers for weighted (non-average) merges using the unified API.
 // Callers compute:
 //   pixelsize = bits_per_pixel <= 8 ? 1 : (bits_per_pixel == 32 ? 4 : 2)
@@ -133,7 +135,10 @@ private:
 //   weight_i  = (int)(weight_f * 32768.0f + 0.5f)
 //   invweight_i = 32768 - weight_i
 // Float clips use get_weighted_merge_float_fn; integer clips use get_weighted_merge_fn.
-inline weighted_merge_fn_t* get_weighted_merge_fn(int cpuFlags) {
+inline weighted_merge_fn_t* get_weighted_merge_fn(int cpuFlags, int weight_i) {
+  if (weight_i == 0 || weight_i == 32768)
+    return &weighted_merge_return_a_or_b;
+
 #ifdef INTEL_INTRINSICS
   if (cpuFlags & CPUF_AVX2) return &weighted_merge_avx2;
   if (cpuFlags & CPUF_SSE2) return &weighted_merge_sse2;

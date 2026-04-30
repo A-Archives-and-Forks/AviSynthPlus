@@ -118,6 +118,43 @@ static void blend16_masked_avx2_row(
 }
 
 // ---------------------------------------------------------------------------
+// float row — mask already has opacity baked in (range 0.0 to 1.0).
+// Linear interpolation: p1[x] = p1[x] * (1.0f - mask[x]) + p2[x] * mask[x]
+// 8 pixels per step.
+// ---------------------------------------------------------------------------
+#if defined(GCC) || defined(CLANG)
+__attribute__((__target__("avx2")))
+#endif
+static void blend_masked_float_avx2_row(
+  float* p1, const float* p2, const float* mask, int width)
+{
+  int x = 0;
+  // const __m256 v_one = _mm256_set1_ps(1.0f); in case of 1-x implementation
+
+  for (; x <= width - 8; x += 8) {
+    __m256 m = _mm256_loadu_ps(mask + x);
+    __m256 a = _mm256_loadu_ps(p1 + x);
+    __m256 b = _mm256_loadu_ps(p2 + x);
+
+    // Standard lerp: a + m * (b - a)
+    // This is generally more accurate and faster (1 mul, 2 adds) than 
+    // a * (1-m) + b * m (2 muls, 2 adds).
+    __m256 diff = _mm256_sub_ps(b, a);
+    __m256 res = _mm256_add_ps(a, _mm256_mul_ps(m, diff));
+
+    _mm256_storeu_ps(p1 + x, res);
+  }
+
+  // Scalar tail
+  for (; x < width; ++x) {
+    const float m = mask[x];
+    const float a = p1[x];
+    const float b = p2[x];
+    p1[x] = a + m * (b - a);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Inner loop — full_opacity known at compile time.
 // Rowprep bakes opacity when !full_opacity; blend row receives pre-scaled mask.
 // MASK444 + full_opacity: returns mask ptr directly (no buffer, no copy).
@@ -180,8 +217,38 @@ static void masked_merge_avx2_impl_inner(
 }
 
 // ---------------------------------------------------------------------------
+// Inner loop — full_opacity known at compile time.
+// Rowprep bakes opacity when !full_opacity; blend row receives pre-scaled mask.
+// MASK444 + full_opacity: returns mask ptr directly (no buffer, no copy).
+// MASK444 + !full_opacity: copies row with opacity scaling into buffer.
+// ---------------------------------------------------------------------------
+template<MaskMode maskMode, bool full_opacity>
+#if defined(GCC) || defined(CLANG)
+__attribute__((__target__("avx2")))
+#endif
+static void masked_merge_float_avx2_impl_inner(
+  BYTE* p1, const BYTE* p2, const BYTE* mask,
+  int p1_pitch, int p2_pitch, int mask_pitch,
+  int width, int height, float opacity)
+{
+  const float* maskp = reinterpret_cast<const float*>(mask);
+  const int mpx = mask_pitch / sizeof(float);
+  const int mask_adv = (maskMode == MASK420 || maskMode == MASK420_MPEG2 || maskMode == MASK420_TOPLEFT) ? mpx * 2 : mpx;
+
+  std::vector<float> eff_buf;
+  if constexpr (maskMode != MASK444 || !full_opacity) eff_buf.resize(width);
+
+  for (int y = 0; y < height; y++) {
+    const float* eff = prepare_effective_mask_for_row_float_avx2<maskMode, full_opacity>(
+      maskp, mpx, width, eff_buf, opacity);
+    blend_masked_float_avx2_row(
+      reinterpret_cast<float*>(p1), reinterpret_cast<const float*>(p2), eff, width);
+    p1 += p1_pitch; p2 += p2_pitch; maskp += mask_adv;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Outer: dispatch on full_opacity (opacity == max_pixel_value) at the call site.
-// Public signature unchanged — existing callers and function-pointer tables work.
 // ---------------------------------------------------------------------------
 template<MaskMode maskMode>
 #if defined(GCC) || defined(CLANG)
@@ -200,3 +267,21 @@ static void masked_merge_avx2_impl(
     masked_merge_avx2_impl_inner<maskMode, false>(
       p1, p2, mask, p1_pitch, p2_pitch, mask_pitch, width, height, opacity, bits_per_pixel);
 }
+
+template<MaskMode maskMode>
+#if defined(GCC) || defined(CLANG)
+__attribute__((__target__("avx2")))
+#endif
+static void masked_merge_float_avx2_impl(
+  BYTE* p1, const BYTE* p2, const BYTE* mask,
+  int p1_pitch, int p2_pitch, int mask_pitch,
+  int width, int height, float opacity)
+{
+  if (opacity >= 1.0f)
+    masked_merge_float_avx2_impl_inner<maskMode, true>(
+      p1, p2, mask, p1_pitch, p2_pitch, mask_pitch, width, height, opacity);
+  else
+    masked_merge_float_avx2_impl_inner<maskMode, false>(
+      p1, p2, mask, p1_pitch, p2_pitch, mask_pitch, width, height, opacity);
+}
+

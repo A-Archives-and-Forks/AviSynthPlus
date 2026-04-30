@@ -102,6 +102,43 @@ static AVS_FORCEINLINE void blend16_masked_sse41_row(
 }
 
 // ---------------------------------------------------------------------------
+// float row — mask already has opacity baked in (range 0.0 to 1.0).
+// Linear interpolation: p1[x] = p1[x] * (1.0f - mask[x]) + p2[x] * mask[x]
+// 4 pixels per step.
+// ---------------------------------------------------------------------------
+#if defined(GCC) || defined(CLANG)
+__attribute__((__target__("sse41")))
+#endif
+static void blend_masked_float_sse41_row(
+  float* p1, const float* p2, const float* mask, int width)
+{
+  int x = 0;
+  // const __m128 v_one = _mm_set1_ps(1.0f); in case of 1-x implementation
+
+  for (; x <= width - 4; x += 4) {
+    __m128 m = _mm_loadu_ps(mask + x);
+    __m128 a = _mm_loadu_ps(p1 + x);
+    __m128 b = _mm_loadu_ps(p2 + x);
+
+    // Standard lerp: a + m * (b - a)
+    // This is generally more accurate and faster (1 mul, 2 adds) than 
+    // a * (1-m) + b * m (2 muls, 2 adds).
+    __m128 diff = _mm_sub_ps(b, a);
+    __m128 res = _mm_add_ps(a, _mm_mul_ps(m, diff));
+
+    _mm_storeu_ps(p1 + x, res);
+  }
+
+  // Scalar tail
+  for (; x < width; ++x) {
+    const float m = mask[x];
+    const float a = p1[x];
+    const float b = p2[x];
+    p1[x] = a + m * (b - a);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Inner loop — full_opacity known at compile time.
 // Rowprep bakes opacity when !full_opacity; blend row receives pre-scaled mask.
 // MASK444 + full_opacity: returns mask ptr directly (no buffer, no copy).
@@ -164,6 +201,37 @@ static AVS_FORCEINLINE void masked_merge_sse41_impl_inner(
 }
 
 // ---------------------------------------------------------------------------
+// Inner loop — full_opacity known at compile time.
+// Rowprep bakes opacity when !full_opacity; blend row receives pre-scaled mask.
+// MASK444 + full_opacity: returns mask ptr directly (no buffer, no copy).
+// MASK444 + !full_opacity: copies row with opacity scaling into buffer.
+// ---------------------------------------------------------------------------
+template<MaskMode maskMode, bool full_opacity>
+#if defined(GCC) || defined(CLANG)
+__attribute__((__target__("sse4.1")))
+#endif
+static void masked_merge_float_sse41_impl_inner(
+  BYTE* p1, const BYTE* p2, const BYTE* mask,
+  int p1_pitch, int p2_pitch, int mask_pitch,
+  int width, int height, float opacity)
+{
+  const float* maskp = reinterpret_cast<const float*>(mask);
+  const int mpx = mask_pitch / sizeof(float);
+  const int mask_adv = (maskMode == MASK420 || maskMode == MASK420_MPEG2 || maskMode == MASK420_TOPLEFT) ? mpx * 2 : mpx;
+
+  std::vector<float> eff_buf;
+  if constexpr (maskMode != MASK444 || !full_opacity) eff_buf.resize(width);
+
+  for (int y = 0; y < height; y++) {
+    const float* eff = prepare_effective_mask_for_row_float_sse41<maskMode, full_opacity>(
+      maskp, mpx, width, eff_buf, opacity);
+    blend_masked_float_sse41_row(
+      reinterpret_cast<float*>(p1), reinterpret_cast<const float*>(p2), eff, width);
+    p1 += p1_pitch; p2 += p2_pitch; maskp += mask_adv;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Outer: dispatch on full_opacity (opacity == max_pixel_value) at the call site.
 // Public signature unchanged — existing callers and function-pointer tables work.
 // ---------------------------------------------------------------------------
@@ -183,4 +251,21 @@ static void masked_merge_sse41_impl(
   else
     masked_merge_sse41_impl_inner<maskMode, false>(
       p1, p2, mask, p1_pitch, p2_pitch, mask_pitch, width, height, opacity, bits_per_pixel);
+}
+
+template<MaskMode maskMode>
+#if defined(GCC) || defined(CLANG)
+__attribute__((__target__("sse4.1")))
+#endif
+static void masked_merge_float_sse41_impl(
+  BYTE* p1, const BYTE* p2, const BYTE* mask,
+  int p1_pitch, int p2_pitch, int mask_pitch,
+  int width, int height, float opacity)
+{
+  if (opacity >= 1.0f)
+    masked_merge_float_sse41_impl_inner<maskMode, true>(
+      p1, p2, mask, p1_pitch, p2_pitch, mask_pitch, width, height, opacity);
+  else
+    masked_merge_float_sse41_impl_inner<maskMode, false>(
+      p1, p2, mask, p1_pitch, p2_pitch, mask_pitch, width, height, opacity);
 }

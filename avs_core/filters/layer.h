@@ -66,7 +66,7 @@ using layer_yuv_lighten_darken_f_c_t = void (BYTE* dstp8, BYTE* dstp8_u, BYTE* d
   int mask_pitch,
   int width, int height, float level, float thresh);
 
-using layer_planarrgb_lighten_darken_c_t = void(BYTE** dstp8, const BYTE** ovrp8, const BYTE* maskp8, int dst_pitch, int overlay_pitch, int mask_pitch, int width, int height, int level, int thresh, int bits_per_pixel);
+using layer_planarrgb_lighten_darken_c_t = void(BYTE** dstp8, const BYTE** ovrp8, const BYTE* maskp8, int dst_pitch, int overlay_pitch, int mask_pitch, int width, int height, int opacity_i, int thresh, int bits_per_pixel);
 using layer_planarrgb_lighten_darken_f_c_t = void(BYTE** dstp8, const BYTE** ovrp8, const BYTE* maskp8, int dst_pitch, int overlay_pitch, int mask_pitch, int width, int height, float opacity, float thresh);
 
 // YUV Mul function pointers
@@ -80,6 +80,30 @@ using layer_yuv_mul_f_c_t = void(BYTE* dstp8, const BYTE* ovrp8, const BYTE* mas
   int dst_pitch, int overlay_pitch, int mask_pitch,
   int width, int height, float opacity);
 
+// YUV mulovr ("Overlay-style multiply") function pointers.
+// Overlay luma drives all planes: dark overlay Y darkens base Y and desaturates base UV.
+// ovrp8: overlay Y plane only (UV planes of the overlay are not used).
+// maskp8: overlay alpha plane at luma resolution (nullptr when has_alpha=false).
+// integer 8-16 bits version
+using layer_yuv_mulspec_c_t = void(
+  BYTE* dstp8, BYTE* dstp8_u, BYTE* dstp8_v,
+  const BYTE* ovrp8,
+  const BYTE* maskp8,
+  int dst_pitch, int dst_pitchUV,
+  int overlay_pitch,
+  int mask_pitch,
+  int width, int height, int level, int bits_per_pixel);
+
+// 32 bit float version
+using layer_yuv_mulspec_f_c_t = void(
+  BYTE* dstp8, BYTE* dstp8_u, BYTE* dstp8_v,
+  const BYTE* ovrp8,
+  const BYTE* maskp8,
+  int dst_pitch, int dst_pitchUV,
+  int overlay_pitch,
+  int mask_pitch,
+  int width, int height, float opacity);
+
 // YUV Add function pointers
 using layer_yuv_add_c_t = void(BYTE* dstp8, const BYTE* ovrp8, const BYTE* mask8,
   int dst_pitch, int overlay_pitch, int mask_pitch,
@@ -90,7 +114,7 @@ using layer_yuv_add_f_c_t = void(BYTE* dstp8, const BYTE* ovrp8, const BYTE* mas
   int width, int height, float opacity);
 
 // integer 8-16 bits version
-using layer_planarrgb_add_c_t = void(BYTE** dstp8, const BYTE** ovrp8, const BYTE* maskp8, int dst_pitch, int overlay_pitch, int mask_pitch, int width, int height, int level, int bits_per_pixel);
+using layer_planarrgb_add_c_t = void(BYTE** dstp8, const BYTE** ovrp8, const BYTE* maskp8, int dst_pitch, int overlay_pitch, int mask_pitch, int width, int height, int opacity_i, int bits_per_pixel);
 // 32 bit float version
 using layer_planarrgb_add_f_c_t = void(BYTE** dstp8, const BYTE** ovrp8, const BYTE* maskp8, int dst_pitch, int overlay_pitch, int mask_pitch, int width, int height, float opacity);
 
@@ -352,7 +376,7 @@ private:
   const  char* Op;
   int levelB, ThresholdParam;
   int ydest, xdest, ysrc, xsrc, ofsX, ofsY, ycount, xcount, overlay_frames;
-  const bool chroma;
+  const bool chroma; // use_chroma
   bool hasAlpha;             // overlay has alpha plane → per-pixel blend weight
   bool process_alpha_channel; // both clips have alpha → blend A channel like colour channels
   int bits_per_pixel;

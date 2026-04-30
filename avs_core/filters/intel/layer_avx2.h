@@ -69,16 +69,16 @@ template<int mode>
 void layer_rgb32_lighten_darken_avx2(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level, int thresh);
 
 void get_layer_yuv_mul_functions_avx2(
-  bool is_chroma, bool use_chroma, bool hasAlpha,
+  bool is_chroma, bool hasAlpha,
   int placement, VideoInfo& vi, int bits_per_pixel,
   layer_yuv_mul_c_t** layer_fn,
   layer_yuv_mul_f_c_t** layer_f_fn);
 
-void get_layer_yuv_add_functions_avx2(
-  bool is_chroma, bool use_chroma, bool hasAlpha,
+void get_layer_yuv_masked_add_functions_avx2(
+  bool is_chroma,
   int placement, VideoInfo& vi, int bits_per_pixel,
-  layer_yuv_add_c_t** layer_fn,
-  layer_yuv_add_f_c_t** layer_f_fn);
+  /*out*/masked_merge_fn_t** layer_fn,
+  /*out*/masked_merge_float_fn_t** layer_f_fn);
 
 void get_layer_planarrgb_lighten_darken_functions_avx2(bool isLighten, bool hasAlpha, bool blendAlpha, int bits_per_pixel, /*out*/layer_planarrgb_lighten_darken_c_t** layer_fn, /*out*/layer_planarrgb_lighten_darken_f_c_t** layer_f_fn);
 

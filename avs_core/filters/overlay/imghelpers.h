@@ -83,11 +83,6 @@ public:
     frame(_frame),
     _w(_inw), _h(_inh), _bits_per_pixel(_workingVI.BitsPerComponent()), grey(_grey), maskChroma(nullptr) {
 
-    int pixelsize;
-    if (_bits_per_pixel == 8) pixelsize = 1;
-    else if (_bits_per_pixel <= 16) pixelsize = 2;
-    else pixelsize = 4;
-
     planeCount = _workingVI.NumComponents();
 
     planes = (_workingVI.IsYUV() || _workingVI.IsYUVA()) ? planes_y : planes_r;
@@ -163,6 +158,11 @@ public:
 #if 0
         // 4:2:0 former path
         {
+          int pixelsize;
+          if (_bits_per_pixel == 8) pixelsize = 1;
+          else if (_bits_per_pixel <= 16) pixelsize = 2;
+          else pixelsize = 4;
+
           int tmppitch = AlignNumber((_w >> xSubSamplingShifts[1]) * pixelsize, FRAME_ALIGN);
           maskChroma = static_cast<BYTE*>(Env->Allocate(
             tmppitch * (_h >> ySubSamplingShifts[1]), 64, AVS_POOLED_ALLOC));

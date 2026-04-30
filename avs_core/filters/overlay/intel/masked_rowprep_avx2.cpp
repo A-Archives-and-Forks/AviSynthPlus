@@ -11,6 +11,8 @@
 #include <immintrin.h>
 #endif
 
+#include "avs/config.h"
+#include "../blend_common.h"
 #include "masked_rowprep_avx2.h"   // own declarations + simd_magic_div_32_avx2 inline
 #include <vector>
 #include <cstdint>
@@ -497,6 +499,348 @@ static void fill_mask411_avx2(
            : (pixel_t)magic_div_rt<pixel_t>((uint32_t)avg * (uint32_t)opacity_i + (uint32_t)half, magic);
   }
 }
+// ---------------------------
+// End of integer mask helpers
+// ---------------------------
+
+// ---------------------------
+// Start of float mask helpers
+// ---------------------------
+
+// MASK422 — horizontal 2-tap box average.
+//   avg[x] = (src[x*2] + src[x*2+1]) * 0.5f
+//
+// float: 8 output pixels / iteration (16 input floats loaded)
+// ---------------------------------------------------------------------------
+template<bool full_opacity>
+#if defined(GCC) || defined(CLANG)
+__attribute__((__target__("avx2")))
+#endif
+static void fill_mask422_float_avx2(
+  float* dst, const float* src, int width, float opacity)
+{
+  int x = 0;
+  const __m256 v_opacity = _mm256_set1_ps(opacity);
+  const __m256 v_05 = _mm256_set1_ps(0.5f);
+
+  for (; x <= width - 8; x += 8) {
+    // 1. Load 16 floats (two 256-bit registers)
+    __m256 r_lo = _mm256_loadu_ps(src + x * 2);
+    __m256 r_hi = _mm256_loadu_ps(src + x * 2 + 8);
+
+    // 2. De-interleave Even and Odd samples
+    // r_lo: [s0, s1, s2, s3, s4, s5, s6, s7]
+    // r_hi: [s8, s9, s10, s11, s12, s13, s14, s15]
+    __m256 even_shuf = _mm256_shuffle_ps(r_lo, r_hi, _MM_SHUFFLE(2, 0, 2, 0));
+    __m256 odd_shuf = _mm256_shuffle_ps(r_lo, r_hi, _MM_SHUFFLE(3, 1, 3, 1));
+
+    // Fix lane crossing to get contiguous even and odd vectors
+    __m256 even = _mm256_castsi256_ps(
+      _mm256_permute4x64_epi64(_mm256_castps_si256(even_shuf), _MM_SHUFFLE(3, 1, 2, 0))
+    );
+    __m256 odd = _mm256_castsi256_ps(
+      _mm256_permute4x64_epi64(_mm256_castps_si256(odd_shuf), _MM_SHUFFLE(3, 1, 2, 0))
+    );
+
+    // 3. Average: (even + odd) * 0.5
+    __m256 avg = _mm256_mul_ps(_mm256_add_ps(even, odd), v_05);
+
+    if constexpr (!full_opacity) {
+      avg = _mm256_mul_ps(avg, v_opacity);
+    }
+
+    // 4. Store 8 output pixels
+    _mm256_storeu_ps(dst + x, avg);
+  }
+
+  // Scalar Tail
+  for (; x < width; x++) {
+    const float avg = (src[x * 2] + src[x * 2 + 1]) * 0.5f;
+    dst[x] = full_opacity ? avg : avg * opacity;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MASK422_MPEG2 — horizontal 3-tap triangle filter with sliding window carry.
+//   avg[x] = (left + 2*src[x*2] + src[x*2+1]) * 0.25f
+//
+// float: 8 output pixels / iteration (16 input floats per iteration)
+// Cross-lane carry: 1 element = 12-byte alignr (4 bytes per float).
+// ---------------------------------------------------------------------------
+template<bool full_opacity>
+#if defined(GCC) || defined(CLANG)
+__attribute__((__target__("avx2")))
+#endif
+static void fill_mask422_mpeg2_float_avx2(
+  float* dst, const float* src, int width, float opacity)
+{
+  int x = 0;
+
+  // Seed the carry (left neighbor) with the first even sample 
+  // or as per your boundary requirements.
+  float right_val = src[0];
+
+  const __m256 v_opacity = _mm256_set1_ps(opacity);
+  const __m256 v_025 = _mm256_set1_ps(0.25f);
+
+  // v_prev_carry holds the last 'odd' sample from the previous vector
+  __m256 v_prev_carry = _mm256_set1_ps(right_val);
+
+  for (; x <= width - 8; x += 8) {
+    // 1. Load 16 floats (one full source block for 8 output pixels)
+    __m256 v0 = _mm256_loadu_ps(src + x * 2);
+
+    // 2. De-interleave: Even (src[x*2]) and Odd (src[x*2+1])
+    // s0, s1, s2, s3, s4, s5, s6, s7 | s8, s9, s10, s11, s12, s13, s14, s15
+    __m256 even = _mm256_permutevar8x32_ps(v0, _mm256_set_epi32(14, 12, 10, 8, 6, 4, 2, 0));
+    __m256 odd = _mm256_permutevar8x32_ps(v0, _mm256_set_epi32(15, 13, 11, 9, 7, 5, 3, 1));
+
+    // 3. Sliding Window: Construct 'left' neighbor vector
+    // shifted_odd: [prev_o4..o7, o0..o3] - brings previous high into current low
+    __m256 shifted_odd = _mm256_permute2f128_ps(odd, v_prev_carry, 0x02);
+
+    // left: [prev_o7, o0, o1, o2 | o3, o4, o5, o6]
+    // alignr by 12 bytes shifts the 128-bit window by 3 floats (leaving 1 float carry)
+    __m256 left = _mm256_castsi256_ps(_mm256_alignr_epi8(
+      _mm256_castps_si256(odd),
+      _mm256_castps_si256(shifted_odd), 12));
+
+    // 4. Filter: avg = (left + 2*even + odd) * 0.25
+    __m256 avg = _mm256_add_ps(left, _mm256_add_ps(_mm256_add_ps(even, even), odd));
+    avg = _mm256_mul_ps(avg, v_025);
+
+    if constexpr (!full_opacity) {
+      avg = _mm256_mul_ps(avg, v_opacity);
+    }
+
+    _mm256_storeu_ps(dst + x, avg);
+
+    // 5. Carry the last element of 'odd' (index 7) for the next iteration
+    v_prev_carry = _mm256_permutevar8x32_ps(odd, _mm256_set1_epi32(7));
+  }
+
+  // Extraction for scalar tail
+  right_val = _mm256_cvtss_f32(v_prev_carry);
+
+  for (; x < width; x++) {
+    const float left = right_val;
+    const float mid = src[x * 2];
+    right_val = src[x * 2 + 1];
+
+    const float avg = (left + 2.0f * mid + right_val) * 0.25f;
+    dst[x] = full_opacity ? avg : avg * opacity;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MASK420 — 2x2 box average (MPEG-1 placement).
+//   avg[x] = (row0[x*2] + row0[x*2+1] + row1[x*2] + row1[x*2+1]) * 0.25f
+//
+// float: 8 output pixels / iteration (requires 16 input floats per row)
+// ---------------------------------------------------------------------------
+template<bool full_opacity>
+#if defined(GCC) || defined(CLANG)
+__attribute__((__target__("avx2")))
+#endif
+static void fill_mask420_float_avx2(
+  float* dst, const float* row0, int mask_pitch, int width, float opacity)
+{
+  const float* row1 = row0 + mask_pitch;
+  int x = 0;
+
+  const __m256 v_opacity = _mm256_set1_ps(opacity);
+  const __m256 v_025 = _mm256_set1_ps(0.25f);
+
+  for (; x <= width - 8; x += 8) {
+    // 1. Load 16 floats from each row (total 32 floats per iteration)
+    __m256 r0_lo = _mm256_loadu_ps(row0 + x * 2);
+    __m256 r0_hi = _mm256_loadu_ps(row0 + x * 2 + 8);
+    __m256 r1_lo = _mm256_loadu_ps(row1 + x * 2);
+    __m256 r1_hi = _mm256_loadu_ps(row1 + x * 2 + 8);
+
+    // 2. Vertical Sum: Interleaved [e0, o0, e1, o1, e2, o2, e3, o3...]
+    __m256 s_lo = _mm256_add_ps(r0_lo, r1_lo);
+    __m256 s_hi = _mm256_add_ps(r0_hi, r1_hi);
+
+    // 3. Horizontal Sum via De-interleave
+    // We shuffle 's_lo' and 's_hi' to separate even and odd indices
+    __m256 even_shuf = _mm256_shuffle_ps(s_lo, s_hi, _MM_SHUFFLE(2, 0, 2, 0));
+    __m256 odd_shuf = _mm256_shuffle_ps(s_lo, s_hi, _MM_SHUFFLE(3, 1, 3, 1));
+
+    // Fix AVX2 lane crossing: [L_even, H_even] and [L_odd, H_odd]
+    __m256 even = _mm256_castsi256_ps(
+      _mm256_permute4x64_epi64(_mm256_castps_si256(even_shuf), _MM_SHUFFLE(3, 1, 2, 0))
+    );
+    __m256 odd = _mm256_castsi256_ps(
+      _mm256_permute4x64_epi64(_mm256_castps_si256(odd_shuf), _MM_SHUFFLE(3, 1, 2, 0))
+    );
+
+    // 4. Final Average: (even + odd) * 0.25
+    __m256 avg = _mm256_mul_ps(_mm256_add_ps(even, odd), v_025);
+
+    if constexpr (!full_opacity) {
+      avg = _mm256_mul_ps(avg, v_opacity);
+    }
+
+    _mm256_storeu_ps(dst + x, avg);
+  }
+
+  // Scalar Tail
+  for (; x < width; x++) {
+    const float sum = row0[x * 2] + row0[x * 2 + 1] +
+      row1[x * 2] + row1[x * 2 + 1];
+    const float avg = sum * 0.25f;
+    dst[x] = full_opacity ? avg : avg * opacity;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MASK420_MPEG2 — horizontal 3-tap triangle filter with vertical 2-row sum and
+// sliding-window carry. Filter logic:
+//   pe[x]  = row0[x*2]   + row1[x*2]     (vertical sum of even-indexed pairs)
+//   po[x]  = row0[x*2+1] + row1[x*2+1]   (vertical sum of odd-indexed pairs)
+//   avg[x] = (po[x-1] + 2*pe[x] + po[x]) * 0.125f
+//
+// float: 8 output pixels / iteration (32-byte load per row -> 16 floats).
+// Cross-lane carry: 1 element = 12-byte alignr (4 bytes per float).
+// ---------------------------------------------------------------------------
+template<bool full_opacity>
+#if defined(GCC) || defined(CLANG)
+__attribute__((__target__("avx2")))
+#endif
+static void fill_mask420_mpeg2_float_avx2(
+  float* dst, const float* row0, int mask_pitch, int width, float opacity)
+{
+  const float* row1 = row0 + mask_pitch;
+  int x = 0;
+
+  // We need the "odd" sum from the pixel immediately before the SIMD block.
+  // If x=0, this is technically out of bounds or needs a padding strategy.
+  // Assuming p0 is the vertical sum at index -1 or starting logic:
+  float right_val = row0[0] + row1[0];
+  // Broadcast the last 'odd' sum into the carry register
+  // We only need the very last element of the previous 'odd' vector.
+  __m256 v_prev_odd = _mm256_set1_ps(right_val);
+  const __m256 v_opacity = _mm256_set1_ps(opacity);
+
+  for (; x <= width - 8; x += 8) {
+    // 1. Load 16 floats from each row (2x 256-bit loads)
+    __m256 r0_lo = _mm256_loadu_ps(row0 + x * 2);
+    __m256 r0_hi = _mm256_loadu_ps(row0 + x * 2 + 8);
+    __m256 r1_lo = _mm256_loadu_ps(row1 + x * 2);
+    __m256 r1_hi = _mm256_loadu_ps(row1 + x * 2 + 8);
+
+    // 2. Vertical Sum (pe and po interleaved: [e0, o0, e1, o1...])
+    __m256 sum_lo = _mm256_add_ps(r0_lo, r1_lo);
+    __m256 sum_hi = _mm256_add_ps(r0_hi, r1_hi);
+
+    // 3. De-interleave Even and Odd
+    // Use shuffle to get [e0, e1, e2, e3, e4, e5, e6, e7] and [o0, o1...]
+    // Note: _mm256_shuffle_ps works within 128-bit lanes, so we fix it with a permute.
+    __m256 even_shuf = _mm256_shuffle_ps(sum_lo, sum_hi, _MM_SHUFFLE(2, 0, 2, 0));
+    __m256 odd_shuf = _mm256_shuffle_ps(sum_lo, sum_hi, _MM_SHUFFLE(3, 1, 3, 1));
+
+    // Fix lane crossing: [L0, L1, H0, H1] -> [L0, H0, L1, H1]
+    __m256 even = _mm256_castsi256_ps(
+      _mm256_permute4x64_epi64(_mm256_castps_si256(even_shuf), _MM_SHUFFLE(3, 1, 2, 0))
+    );
+    __m256 odd = _mm256_castsi256_ps(
+      _mm256_permute4x64_epi64(_mm256_castps_si256(odd_shuf), _MM_SHUFFLE(3, 1, 2, 0))
+    );
+
+    // 4. Construct 'left' vector: [prev_o7, o0, o1, o2, o3, o4, o5, o6]
+    // Slide 'odd' right by one element, bringing in the last element from the previous iteration.
+    __m256 shifted_odd = _mm256_permute2f128_ps(odd, v_prev_odd, 0x02);
+    __m256 left = _mm256_castsi256_ps(_mm256_alignr_epi8(
+      _mm256_castps_si256(odd),
+      _mm256_castps_si256(shifted_odd), 12));
+
+    // 5. Triangle Filter: (left + 2*even + odd) / 8
+    __m256 avg = _mm256_mul_ps(
+      _mm256_add_ps(_mm256_add_ps(left, _mm256_add_ps(even, even)), odd),
+      _mm256_set1_ps(0.125f)
+    );
+
+    if constexpr (!full_opacity) {
+      avg = _mm256_mul_ps(avg, v_opacity);
+    }
+
+    _mm256_storeu_ps(dst + x, avg);
+
+    // Update carry for next iteration: the last 'odd' sum becomes the next 'left' start
+    v_prev_odd = _mm256_set1_ps(((float*)&odd)[7]);
+  }
+
+  // Bridge to scalar tail: Extract the last odd sum processed by SIMD
+  right_val = _mm256_cvtss_f32(_mm256_permutevar8x32_ps(v_prev_odd, _mm256_setzero_si256()));
+  for (; x < width; x++) {
+    const float left = right_val;
+    const float mid = row0[x * 2] + row1[x * 2];
+    right_val = row0[x * 2 + 1] + row1[x * 2 + 1];
+    const float avg = (left + 2 * mid + right_val + 4) * 0.125f; // / 8.0f
+    dst[x] = full_opacity ? avg : avg * opacity;
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// MASK422_TOPLEFT — left co-sited point sample (no averaging).
+//   dst[x] = src[x*2]
+// ---------------------------------------------------------------------------
+template<bool full_opacity>
+#if defined(GCC) || defined(CLANG)
+__attribute__((__target__("avx2")))
+#endif
+static void fill_mask422_topleft_float_avx2(
+  float* dst, const float* src, int width,
+  float opacity)
+{
+  int x = 0;
+  for (; x < width; x++) {
+    const float val = src[x * 2];
+    dst[x] = full_opacity ? val : val * opacity;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MASK420_TOPLEFT — top-left co-sited point sample (top row only, no averaging).
+//   dst[x] = row0[x*2]
+// ---------------------------------------------------------------------------
+template<bool full_opacity>
+#if defined(GCC) || defined(CLANG)
+__attribute__((__target__("avx2")))
+#endif
+static void fill_mask420_topleft_float_avx2(
+  float* dst, const float* row0, int /*mask_pitch*/, int width,
+  float opacity)
+{
+  // Identical to fill_mask422_topleft_float_avx2: top row only, left co-sited.
+  fill_mask422_topleft_float_avx2<full_opacity>(dst, row0, width, opacity);
+}
+
+// ---------------------------------------------------------------------------
+// MASK411 — horizontal 4-tap box average.
+//   avg[x] = (src[x*4]+src[x*4+1]+src[x*4+2]+src[x*4+3]) / 4 (*0.25)
+// ---------------------------------------------------------------------------
+template<bool full_opacity>
+#if defined(GCC) || defined(CLANG)
+__attribute__((__target__("avx2")))
+#endif
+static void fill_mask411_float_avx2(
+  float* dst, const float* src, int width,
+  float opacity)
+{
+  int x = 0;
+  for (; x < width; x++) {
+    const float avg = (src[x * 4] + src[x * 4 + 1] + src[x * 4 + 2] + src[x * 4 + 3]) * 0.25f;
+    dst[x] = full_opacity ? avg : avg * opacity;
+  }
+}
+
+// ---------------------------
+// End of float mask helpers
+// ---------------------------
+
 
 // ---------------------------------------------------------------------------
 // prepare_effective_mask_for_row_avx2
@@ -567,89 +911,58 @@ const pixel_t* prepare_effective_mask_for_row_avx2(
   }
 }
 
-// ---------------------------------------------------------------------------
-// prepare_effective_mask_for_row_level_baked_avx2
-// ---------------------------------------------------------------------------
-template<MaskMode maskMode, typename pixel_t, bool full_opacity>
+template<MaskMode maskMode, bool full_opacity>
 #if defined(GCC) || defined(CLANG)
 __attribute__((__target__("avx2")))
 #endif
-const pixel_t* prepare_effective_mask_for_row_level_baked_avx2(
-  const pixel_t* maskp,
+AVS_FORCEINLINE const float* prepare_effective_mask_for_row_float_avx2(
+  const float* maskp,
   int mask_pitch,
   int width,
-  std::vector<pixel_t>& buf,
-  int level,
-  int bits_per_pixel)
+  std::vector<float>& buf,
+  float opacity)
 {
   if constexpr (maskMode == MASK444) {
-    if constexpr (full_opacity)
+    if constexpr (full_opacity) {
       return maskp;
-    pixel_t* dst = buf.data();
-    int x = 0;
-    if constexpr (sizeof(pixel_t) == 1) {
-      const __m256i v_level = _mm256_set1_epi16((short)level);
-      const __m256i v_one   = _mm256_set1_epi16(1);
-      for (; x <= width - 16; x += 16) {
-        __m256i v = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*)(maskp + x)));
-        __m256i r = _mm256_srli_epi16(_mm256_add_epi16(_mm256_mullo_epi16(v, v_level), v_one), 8);
-        _mm_storeu_si128((__m128i*)(dst + x), avx2_pack_u16_to_u8(r));
-      }
-    } else {
-      const __m256i v_level32 = _mm256_set1_epi32(level);
-      const __m256i v_one32   = _mm256_set1_epi32(1);
-      const __m128i v_bpp     = _mm_cvtsi32_si128(bits_per_pixel);
-      for (; x <= width - 8; x += 8) {
-        __m256i v = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*)(maskp + x)));
-        __m256i r = _mm256_srl_epi32(_mm256_add_epi32(_mm256_mullo_epi32(v, v_level32), v_one32), v_bpp);
-        _mm_storeu_si128((__m128i*)(dst + x), avx2_pack_u32_to_u16(r));
-      }
     }
-    for (; x < width; x++)
-      dst[x] = static_cast<pixel_t>(((uint32_t)maskp[x] * (uint32_t)level + 1u) >> bits_per_pixel);
-    return dst;
-  }
-  else {
-    pixel_t* dst = buf.data();
-    // Pass 1: spatial average, Overlay baking suppressed (full_opacity=true to skip it).
-    if constexpr (maskMode == MASK422)
-      fill_mask422_avx2<pixel_t, true>(dst, maskp, width, 0, 0, {});
-    else if constexpr (maskMode == MASK422_MPEG2)
-      fill_mask422_mpeg2_avx2<pixel_t, true>(dst, maskp, width, 0, 0, {});
-    else if constexpr (maskMode == MASK422_TOPLEFT)
-      fill_mask422_topleft_avx2<pixel_t, true>(dst, maskp, width, 0, 0, {});
-    else if constexpr (maskMode == MASK420)
-      fill_mask420_avx2<pixel_t, true>(dst, maskp, mask_pitch, width, 0, 0, {});
-    else if constexpr (maskMode == MASK420_MPEG2)
-      fill_mask420_mpeg2_avx2<pixel_t, true>(dst, maskp, mask_pitch, width, 0, 0, {});
-    else if constexpr (maskMode == MASK420_TOPLEFT)
-      fill_mask420_topleft_avx2<pixel_t, true>(dst, maskp, mask_pitch, width, 0, 0, {});
-    else if constexpr (maskMode == MASK411)
-      fill_mask411_avx2<pixel_t, true>(dst, maskp, width, 0, 0, {});
-    // Pass 2: level baking (only when !full_opacity).
-    if constexpr (!full_opacity) {
+    else {
+      float* dst = buf.data();
       int x = 0;
-      if constexpr (sizeof(pixel_t) == 1) {
-        const __m256i v_level = _mm256_set1_epi16((short)level);
-        const __m256i v_one   = _mm256_set1_epi16(1);
-        for (; x <= width - 16; x += 16) {
-          __m256i v = _mm256_cvtepu8_epi16(_mm_loadu_si128((__m128i*)(dst + x)));
-          __m256i r = _mm256_srli_epi16(_mm256_add_epi16(_mm256_mullo_epi16(v, v_level), v_one), 8);
-          _mm_storeu_si128((__m128i*)(dst + x), avx2_pack_u16_to_u8(r));
-        }
-      } else {
-        const __m256i v_level32 = _mm256_set1_epi32(level);
-        const __m256i v_one32   = _mm256_set1_epi32(1);
-        const __m128i v_bpp     = _mm_cvtsi32_si128(bits_per_pixel);
-        for (; x <= width - 8; x += 8) {
-          __m256i v = _mm256_cvtepu16_epi32(_mm_loadu_si128((__m128i*)(dst + x)));
-          __m256i r = _mm256_srl_epi32(_mm256_add_epi32(_mm256_mullo_epi32(v, v_level32), v_one32), v_bpp);
-          _mm_storeu_si128((__m128i*)(dst + x), avx2_pack_u32_to_u16(r));
-        }
+      const __m256 v_opacity = _mm256_set1_ps(opacity);
+      for (; x <= width - 8; x += 8) {
+        // just put back opacity * mask
+        __m256 v16 = _mm256_loadu_ps(maskp + x);
+        __m256 scaled = _mm256_mul_ps(v16, v_opacity);
+        _mm256_storeu_ps(dst + x, scaled);
+      }
+      for (; x <= width - 4; x += 4) {
+        // just put back opacity * mask
+        __m128 v16 = _mm_loadu_ps(maskp + x);
+        __m128 scaled = _mm_mul_ps(v16, _mm_set1_ps(opacity));
+        _mm_storeu_ps(dst + x, scaled);
       }
       for (; x < width; x++)
-        dst[x] = static_cast<pixel_t>(((uint32_t)dst[x] * (uint32_t)level + 1u) >> bits_per_pixel);
+        dst[x] = maskp[x] * opacity;
+      return dst;
     }
+  }
+  else {
+    float* dst = buf.data();
+    if constexpr (maskMode == MASK422)
+      fill_mask422_float_avx2<full_opacity>(dst, maskp, width, opacity);
+    else if constexpr (maskMode == MASK422_MPEG2)
+      fill_mask422_mpeg2_float_avx2<full_opacity>(dst, maskp, width, opacity);
+    else if constexpr (maskMode == MASK422_TOPLEFT)
+      fill_mask422_topleft_float_avx2<full_opacity>(dst, maskp, width, opacity);
+    else if constexpr (maskMode == MASK420)
+      fill_mask420_float_avx2<full_opacity>(dst, maskp, mask_pitch, width, opacity);
+    else if constexpr (maskMode == MASK420_MPEG2)
+      fill_mask420_mpeg2_float_avx2<full_opacity>(dst, maskp, mask_pitch, width, opacity);
+    else if constexpr (maskMode == MASK420_TOPLEFT)
+      fill_mask420_topleft_float_avx2<full_opacity>(dst, maskp, mask_pitch, width, opacity);
+    else if constexpr (maskMode == MASK411)
+      fill_mask411_float_avx2<full_opacity>(dst, maskp, width, opacity);
     return dst;
   }
 }
@@ -672,16 +985,17 @@ INST_PREP_AVX2(MASK422_TOPLEFT,  uint8_t)   INST_PREP_AVX2(MASK422_TOPLEFT,  uin
 INST_PREP_AVX2(MASK411,          uint8_t)   INST_PREP_AVX2(MASK411,          uint16_t)
 #undef INST_PREP_AVX2
 
-// prepare_effective_mask_for_row_level_baked_avx2
-#define INST_BAKED_AVX2(mm, pt) \
-  template const pt* prepare_effective_mask_for_row_level_baked_avx2<mm, pt, true> (const pt*, int, int, std::vector<pt>&, int, int); \
-  template const pt* prepare_effective_mask_for_row_level_baked_avx2<mm, pt, false>(const pt*, int, int, std::vector<pt>&, int, int);
-INST_BAKED_AVX2(MASK444,          uint8_t)   INST_BAKED_AVX2(MASK444,          uint16_t)
-INST_BAKED_AVX2(MASK420,          uint8_t)   INST_BAKED_AVX2(MASK420,          uint16_t)
-INST_BAKED_AVX2(MASK420_MPEG2,    uint8_t)   INST_BAKED_AVX2(MASK420_MPEG2,    uint16_t)
-INST_BAKED_AVX2(MASK420_TOPLEFT,  uint8_t)   INST_BAKED_AVX2(MASK420_TOPLEFT,  uint16_t)
-INST_BAKED_AVX2(MASK422,          uint8_t)   INST_BAKED_AVX2(MASK422,          uint16_t)
-INST_BAKED_AVX2(MASK422_MPEG2,    uint8_t)   INST_BAKED_AVX2(MASK422_MPEG2,    uint16_t)
-INST_BAKED_AVX2(MASK422_TOPLEFT,  uint8_t)   INST_BAKED_AVX2(MASK422_TOPLEFT,  uint16_t)
-INST_BAKED_AVX2(MASK411,          uint8_t)   INST_BAKED_AVX2(MASK411,          uint16_t)
-#undef INST_BAKED_AVX2
+// prepare_effective_mask_for_row_avx2
+#define INST_PREP_AVX2(mm) \
+  template const float* prepare_effective_mask_for_row_float_avx2<mm, true> (const float*, int, int, std::vector<float>&, float); \
+  template const float* prepare_effective_mask_for_row_float_avx2<mm, false>(const float*, int, int, std::vector<float>&, float);
+INST_PREP_AVX2(MASK444)
+INST_PREP_AVX2(MASK420)
+INST_PREP_AVX2(MASK420_MPEG2)
+INST_PREP_AVX2(MASK420_TOPLEFT)
+INST_PREP_AVX2(MASK422)
+INST_PREP_AVX2(MASK422_MPEG2)
+INST_PREP_AVX2(MASK422_TOPLEFT)
+INST_PREP_AVX2(MASK411)
+#undef INST_PREP_AVX2
+

@@ -84,7 +84,8 @@ constexpr MagicDiv get_magic_div(int bits_per_pixel) {
 
 // Apply prefetched MagicDiv to value tmp.
 // 8-bit (sizeof(pixel_t)==1) uses the mulhi_epu16 path (32-bit intermediate);
-// wider uses the mul_epu32 path (64-bit intermediate).
+// wider uses the mul_epu32 path (64-bit intermediate)
+// tmp is 0-255 for 8-bit pixels, and up to 65535 at 16-bit pixels.
 template<typename pixel_t>
 AVS_FORCEINLINE static int magic_div_rt(uint32_t tmp, const MagicDiv& magic) {
   if constexpr (sizeof(pixel_t) == 1)
@@ -95,10 +96,10 @@ AVS_FORCEINLINE static int magic_div_rt(uint32_t tmp, const MagicDiv& magic) {
 
 // ============================================================
 // Chroma placement mask support
-// MaskMode moved here from layer.h — shared by Overlay and Layer blend paths.
-// MASK444: mask is already at the plane's resolution (1:1, Overlay path).
+// Shared by Overlay and Layer blend paths.
+// MASK444: mask is already at the plane's resolution (1:1).
 // Other modes: mask is at luma resolution; values are averaged per placement
-//   before blending chroma planes (Layer path).
+//   before blending chroma planes.
 // ============================================================
 
 enum MaskMode {
@@ -126,7 +127,7 @@ AVS_FORCEINLINE static pixel_t calculate_effective_mask(
   const pixel_t* ptr,
   int x,
   int pitch,
-  pixel_t& right_value  // in/out for MPEG2 sliding window modes
+  int& right_value  // in/out for MPEG2 sliding window modes; int to avoid truncation of 2-pixel sums
 ) {
   if constexpr (maskMode == MASK444) {
     // +------+
@@ -266,7 +267,7 @@ AVS_FORCEINLINE static const pixel_t* prepare_effective_mask_for_row(
     }
   }
   else {
-    pixel_t mask_right = 0;
+    int mask_right = 0;  // int: MASK420_MPEG2 stores a 2-pixel sum (up to 510 for 8-bit), pixel_t would truncate
     if constexpr (maskMode == MASK420_MPEG2)
       mask_right = maskp[0] + maskp[0 + mask_pitch];
     else if constexpr (maskMode == MASK422_MPEG2)
@@ -284,55 +285,6 @@ AVS_FORCEINLINE static const pixel_t* prepare_effective_mask_for_row(
   }
 }
 
-// Layer-style level-baked mask preparation: result = (avg * level + 1) >> bits_per_pixel.
-// Unlike Overlay's opacity baking (magic_div / max), this uses a power-of-2 shift
-// matching Layer's inner-loop formula.  Works for all bit depths — for 16-bit the
-// product (≤ 65535 * 65536 = 4,294,901,760) fits in uint32.
-//
-// full_opacity == true  (level >= 1<<bpp): spatial average only (or identity for MASK444).
-// full_opacity == false: spatial average then bake (avg * level + 1) >> bpp.
-//
-// mask_pitch is in pixels (caller has divided by sizeof(pixel_t)).
-// level and bits_per_pixel are ignored when full_opacity == true.
-// For MASK444 + full_opacity=true: returns maskp directly (no buffer needed).
-template<MaskMode maskMode, typename pixel_t, bool full_opacity = false>
-AVS_FORCEINLINE static const pixel_t* prepare_effective_mask_for_row_level_baked(
-  const pixel_t* maskp,
-  int mask_pitch,
-  int width,
-  std::vector<pixel_t>& effective_mask_buffer,
-  int level = 0,
-  int bits_per_pixel = 8
-) {
-  if constexpr (maskMode == MASK444) {
-    if constexpr (full_opacity) {
-      return maskp;
-    } else {
-      for (int x = 0; x < width; ++x)
-        effective_mask_buffer[x] = static_cast<pixel_t>(
-          ((uint32_t)maskp[x] * (uint32_t)level + 1u) >> bits_per_pixel);
-      return effective_mask_buffer.data();
-    }
-  }
-  else {
-    pixel_t mask_right = 0;
-    if constexpr (maskMode == MASK420_MPEG2)
-      mask_right = (pixel_t)(maskp[0] + maskp[0 + mask_pitch]);
-    else if constexpr (maskMode == MASK422_MPEG2)
-      mask_right = maskp[0];
-
-    for (int x = 0; x < width; ++x) {
-      const pixel_t avg = static_cast<pixel_t>(
-        calculate_effective_mask<maskMode>(maskp, x, mask_pitch, mask_right));
-      if constexpr (full_opacity)
-        effective_mask_buffer[x] = avg;
-      else
-        effective_mask_buffer[x] = static_cast<pixel_t>(
-          ((uint32_t)avg * (uint32_t)level + 1u) >> bits_per_pixel);
-    }
-    return effective_mask_buffer.data();
-  }
-}
 
 // Float version of prepare_effective_mask_for_row.
 // full_opacity == true  (default): returns maskp for MASK444; spatial avg for others.
@@ -341,7 +293,7 @@ AVS_FORCEINLINE static const pixel_t* prepare_effective_mask_for_row_level_baked
 // mask_pitch is in floats (caller has divided by sizeof(float)).
 // opacity_f is ignored when full_opacity == true.
 template<MaskMode maskMode, bool full_opacity = true>
-AVS_FORCEINLINE static const float* prepare_effective_mask_for_row_f(
+AVS_FORCEINLINE static const float* prepare_effective_mask_for_row_float_c(
   const float* maskp,
   int mask_pitch,
   int width,
@@ -382,82 +334,122 @@ AVS_FORCEINLINE static const float* prepare_effective_mask_for_row_f(
 //
 // For MASK420/MASK420_MPEG2/MASK420_TOPLEFT the mask pointer advances 2 luma rows per output row.
 // ============================================================
-
-// Inner loop: opacity already baked into effective_mask_ptr by rowprep.
-template<MaskMode maskMode, typename pixel_t, bool full_opacity>
-AVS_FORCEINLINE static void masked_merge_impl_c_inner(
-  BYTE* p1, const BYTE* p2, const BYTE* mask,
-  int p1_pitch, int p2_pitch, int mask_pitch,
-  int width, int height, int opacity, int bits_per_pixel)
+// ---------------------------------------------------------------------------
+// 8-bit row — mask already has opacity baked in by rowprep.
+// 32-wide 16-bit mulhi arithmetic (fast, overflow-safe).
+// ---------------------------------------------------------------------------
+static void blend8_masked_c_row(
+  uint8_t* p1, const uint8_t* p2, const uint8_t* mask,
+  int width)
 {
-  const pixel_t* maskp = reinterpret_cast<const pixel_t*>(mask);
-  mask_pitch /= sizeof(pixel_t);
+  constexpr uint32_t half = 127u;
+  constexpr uint32_t max_val = 255u;
 
-  const MagicDiv magic = get_magic_div(bits_per_pixel);
-  const int max_pixel_value = (1 << bits_per_pixel) - 1;
-  const int half = max_pixel_value / 2;
-
-  // Buffer needed for non-444 averaging, or for 444 when baking opacity.
-  std::vector<pixel_t> effective_mask_buffer;
-  if constexpr (maskMode != MASK444 || !full_opacity)
-    effective_mask_buffer.resize(width);
-
-  for (int y = 0; y < height; y++) {
-    // Opacity is baked in by rowprep (full_opacity=true → identity, false → scaled).
-    const pixel_t* effective_mask_ptr =
-      prepare_effective_mask_for_row<maskMode, pixel_t, full_opacity>(
-        maskp, mask_pitch, width, effective_mask_buffer, opacity, half, magic);
-
-    for (int x = 0; x < width; x++) {
-      // m already has opacity applied; no second magic_div needed.
-      const uint32_t m       = (uint32_t)effective_mask_ptr[x];
-      const uint32_t a       = reinterpret_cast<const pixel_t*>(p1)[x];
-      const uint32_t b       = reinterpret_cast<const pixel_t*>(p2)[x];
-      const uint32_t invmask = (uint32_t)max_pixel_value - m;
-
-      reinterpret_cast<pixel_t*>(p1)[x] = static_cast<pixel_t>(
-        magic_div_rt<pixel_t>(a * invmask + b * m + (uint32_t)half, magic));
-    }
-
-    p1 += p1_pitch;
-    p2 += p2_pitch;
-    if constexpr (maskMode == MASK420 || maskMode == MASK420_MPEG2 || maskMode == MASK420_TOPLEFT)
-      maskp += mask_pitch * 2;
-    else
-      maskp += mask_pitch;
+  int x = 0;
+  for (; x < width; ++x) {
+    const uint32_t ms = mask[x];
+    const uint32_t a = p1[x], b_v = p2[x];
+    const uint32_t tr = a * (max_val - ms) + b_v * ms + half;
+    p1[x] = (uint8_t)((tr * 0x8081u) >> 23);
   }
 }
 
-// Outer: dispatch on full_opacity to select rowprep variant.
-template<MaskMode maskMode, typename pixel_t>
-AVS_FORCEINLINE static void masked_merge_impl_c(
-  BYTE* p1, const BYTE* p2, const BYTE* mask,
-  int p1_pitch, int p2_pitch, int mask_pitch,
-  int width, int height, int opacity, int bits_per_pixel)
+// ---------------------------------------------------------------------------
+// 16-bit row (10, 12, 14, 16 bits) — mask already has opacity baked in.
+// 32-bit arithmetic, 8 pixels per step.
+// ---------------------------------------------------------------------------
+template<int bits_per_pixel>
+static void blend16_masked_c_row(
+  uint16_t* p1, const uint16_t* p2, const uint16_t* mask,
+  int width)
 {
-  const int max_pixel_value = (1 << bits_per_pixel) - 1;
-  if (opacity == max_pixel_value)
-    masked_merge_impl_c_inner<maskMode, pixel_t, true>(
-      p1, p2, mask, p1_pitch, p2_pitch, mask_pitch, width, height, opacity, bits_per_pixel);
-  else
-    masked_merge_impl_c_inner<maskMode, pixel_t, false>(
-      p1, p2, mask, p1_pitch, p2_pitch, mask_pitch, width, height, opacity, bits_per_pixel);
+  constexpr MagicDiv m_div = get_magic_div(bits_per_pixel);
+  constexpr uint32_t max_val = (1u << bits_per_pixel) - 1;
+  constexpr uint32_t half = max_val / 2;
+
+  int x = 0;
+  for (; x < width; ++x) {
+    const uint32_t ms = mask[x];
+    const uint32_t a = p1[x];
+    p1[x] = (uint16_t)magic_div_rt<uint16_t>(a * (max_val - ms) + (uint32_t)p2[x] * ms + half, m_div);
+  }
 }
 
-// Dispatches on bits_per_pixel → pixel_t.
-// Use this when bits_per_pixel is runtime; inlines to a single branch.
-template<MaskMode maskMode>
-AVS_FORCEINLINE static void masked_merge_dispatch_c(
+// ---------------------------------------------------------------------------
+// float row — mask already has opacity baked in (range 0.0 to 1.0).
+// Linear interpolation: p1[x] = p1[x] * (1.0f - mask[x]) + p2[x] * mask[x]
+// 8 pixels per step.
+// ---------------------------------------------------------------------------
+static void blend_masked_float_c_row(
+  float* p1, const float* p2, const float* mask, int width)
+{
+  int x = 0;
+
+  // Scalar tail
+  for (; x < width; ++x) {
+    const float m = mask[x];
+    const float a = p1[x];
+    const float b = p2[x];
+    p1[x] = a + m * (b - a);
+  }
+}
+
+
+// Inner loop: opacity already baked into effective_mask_ptr by rowprep.
+template<MaskMode maskMode, bool full_opacity>
+static void masked_merge_impl_c_inner(
   BYTE* p1, const BYTE* p2, const BYTE* mask,
   int p1_pitch, int p2_pitch, int mask_pitch,
   int width, int height, int opacity, int bits_per_pixel)
 {
-  if (bits_per_pixel == 8)
-    masked_merge_impl_c<maskMode, uint8_t>(
-      p1, p2, mask, p1_pitch, p2_pitch, mask_pitch, width, height, opacity, bits_per_pixel);
-  else
-    masked_merge_impl_c<maskMode, uint16_t>(
-      p1, p2, mask, p1_pitch, p2_pitch, mask_pitch, width, height, opacity, bits_per_pixel);
+  // bits_per_pixel == 8 -> pixel_t is uint8_t, max_pixel_value is 255, magic_div_rt uses mulhi_epu16 path.
+  // bits_per_pixel >8 and <= 16 -> pixel_t is uint16_t, max_pixel_value
+
+  const MagicDiv mag = get_magic_div(bits_per_pixel);
+  const int max_val = (1 << bits_per_pixel) - 1;
+  const int half = max_val / 2;
+
+  if (bits_per_pixel == 8) {
+    const uint8_t* maskp = reinterpret_cast<const uint8_t*>(mask);
+    const int mpx = mask_pitch;
+    const int mask_adv = (maskMode == MASK420 || maskMode == MASK420_MPEG2 || maskMode == MASK420_TOPLEFT) ? mpx * 2 : mpx;
+
+    std::vector<uint8_t> eff_buf;
+    if constexpr (maskMode != MASK444 || !full_opacity) eff_buf.resize(width);
+
+    for (int y = 0; y < height; y++) {
+      const uint8_t* eff = prepare_effective_mask_for_row<maskMode, uint8_t, full_opacity>(
+        maskp, mpx, width, eff_buf, opacity, half, mag);
+      blend8_masked_c_row(
+        reinterpret_cast<uint8_t*>(p1), reinterpret_cast<const uint8_t*>(p2), eff, width);
+      p1 += p1_pitch; p2 += p2_pitch; maskp += mask_adv;
+    }
+    return;
+  }
+
+  const uint16_t* maskp = reinterpret_cast<const uint16_t*>(mask);
+  const int mpx = mask_pitch / 2;
+  const int mask_adv = (maskMode == MASK420 || maskMode == MASK420_MPEG2 || maskMode == MASK420_TOPLEFT) ? mpx * 2 : mpx;
+
+  std::vector<uint16_t> eff_buf;
+  if constexpr (maskMode != MASK444 || !full_opacity) eff_buf.resize(width);
+
+#define BLEND16_LOOP_C(bpp) \
+  for (int y = 0; y < height; y++) { \
+    const uint16_t* eff = prepare_effective_mask_for_row<maskMode, uint16_t, full_opacity>( \
+      maskp, mpx, width, eff_buf, opacity, half, mag); \
+    blend16_masked_c_row<bpp>( \
+      reinterpret_cast<uint16_t*>(p1), reinterpret_cast<const uint16_t*>(p2), eff, width); \
+    p1 += p1_pitch; p2 += p2_pitch; maskp += mask_adv; \
+  } break;
+
+  switch (bits_per_pixel) {
+  case 10: BLEND16_LOOP_C(10)
+  case 12: BLEND16_LOOP_C(12)
+  case 14: BLEND16_LOOP_C(14)
+  case 16: BLEND16_LOOP_C(16)
+  }
+#undef BLEND16_LOOP_C
 }
 
 // Float version — opacity baked into rowprep, inner loop has no * opacity_f.
@@ -465,39 +457,44 @@ template<MaskMode maskMode, bool full_opacity>
 AVS_FORCEINLINE static void masked_merge_impl_float_c_inner(
   BYTE* p1, const BYTE* p2, const BYTE* mask,
   int p1_pitch, int p2_pitch, int mask_pitch,
-  int width, int height, float opacity_f)
+  int width, int height, float opacity)
 {
   const float* maskp = reinterpret_cast<const float*>(mask);
-  mask_pitch /= sizeof(float);
+  const int mpx = mask_pitch / sizeof(float);
+  const int mask_adv = (maskMode == MASK420 || maskMode == MASK420_MPEG2 || maskMode == MASK420_TOPLEFT) ? mpx * 2 : mpx;
 
-  std::vector<float> effective_mask_buffer;
-  if constexpr (maskMode != MASK444 || !full_opacity)
-    effective_mask_buffer.resize(width);
+  std::vector<float> eff_buf;
+  if constexpr (maskMode != MASK444 || !full_opacity) eff_buf.resize(width);
 
   for (int y = 0; y < height; y++) {
-    // Opacity baked in by rowprep (full_opacity=true → identity, false → * opacity_f).
-    const float* effective_mask_ptr =
-      prepare_effective_mask_for_row_f<maskMode, full_opacity>(
-        maskp, mask_pitch, width, effective_mask_buffer, opacity_f);
-
-    for (int x = 0; x < width; x++) {
-      const float m = effective_mask_ptr[x];  // opacity already applied
-      const float a = reinterpret_cast<const float*>(p1)[x];
-      const float b = reinterpret_cast<const float*>(p2)[x];
-      reinterpret_cast<float*>(p1)[x] = a * (1.0f - m) + b * m;
-    }
-
-    p1 += p1_pitch;
-    p2 += p2_pitch;
-    if constexpr (maskMode == MASK420 || maskMode == MASK420_MPEG2 || maskMode == MASK420_TOPLEFT)
-      maskp += mask_pitch * 2;
-    else
-      maskp += mask_pitch;
+    const float* eff = prepare_effective_mask_for_row_float_c<maskMode, full_opacity>(
+      maskp, mpx, width, eff_buf, opacity);
+    blend_masked_float_c_row(
+      reinterpret_cast<float*>(p1), reinterpret_cast<const float*>(p2), eff, width);
+    p1 += p1_pitch; p2 += p2_pitch; maskp += mask_adv;
   }
 }
 
+// ---------------------------------------------------------------------------
+// Outer: dispatch on full_opacity (opacity == max_pixel_value) at the call site.
+// ---------------------------------------------------------------------------
 template<MaskMode maskMode>
-AVS_FORCEINLINE static void masked_merge_impl_float_c(
+AVS_FORCEINLINE static void masked_merge_c_impl(
+  BYTE* p1, const BYTE* p2, const BYTE* mask,
+  int p1_pitch, int p2_pitch, int mask_pitch,
+  int width, int height, int opacity, int bits_per_pixel)
+{
+  const int max_pixel_value = (1 << bits_per_pixel) - 1;
+  if (opacity == max_pixel_value)
+    masked_merge_impl_c_inner<maskMode, true>(
+      p1, p2, mask, p1_pitch, p2_pitch, mask_pitch, width, height, opacity, bits_per_pixel);
+  else
+    masked_merge_impl_c_inner<maskMode, false>(
+      p1, p2, mask, p1_pitch, p2_pitch, mask_pitch, width, height, opacity, bits_per_pixel);
+}
+
+template<MaskMode maskMode>
+AVS_FORCEINLINE static void masked_merge_float_c_impl(
   BYTE* p1, const BYTE* p2, const BYTE* mask,
   int p1_pitch, int p2_pitch, int mask_pitch,
   int width, int height, float opacity_f)
@@ -545,6 +542,13 @@ using masked_merge_float_fn_t = void(
   float opacity_f);
 
 // Family 1 — C reference
+
+void weighted_merge_return_a_or_b(BYTE* p1, const BYTE* p2,
+  int p1_pitch, int p2_pitch,
+  int width, int height,
+  int weight, int invweight,
+  int bits_per_pixel);
+
 void weighted_merge_c(BYTE* p1, const BYTE* p2,
   int p1_pitch, int p2_pitch,
   int width, int height,
@@ -556,23 +560,9 @@ void weighted_merge_float_c(BYTE* p1, const BYTE* p2,
   int width, int height,
   float weight_f);
 
-// Overlay blend C getters — dispatch on is_chroma × maskMode (subtract=false).
-// MASK444 reuses masked_merge_c / masked_merge_float_c; non-MASK444 chroma has dedicated wrappers.
+// Overlay blend C getters — dispatch on is_chroma × maskMode
 masked_merge_fn_t*       get_overlay_blend_masked_fn_c(bool is_chroma, MaskMode maskMode);
 masked_merge_float_fn_t* get_overlay_blend_masked_float_fn_c(bool is_chroma, MaskMode maskMode);
-
-// Family 2 — C reference
-// Integer: opacity pre-scaled to 0..max_pixel_value
-void masked_merge_c(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  int p1_pitch, int p2_pitch, int mask_pitch,
-  int width, int height,
-  int opacity, int bits_per_pixel);
-
-// Float: opacity in 0..1 range
-void masked_merge_float_c(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  int p1_pitch, int p2_pitch, int mask_pitch,
-  int width, int height,
-  float opacity_f);
 
 using overlay_blend_plane_masked_opacity_t = void(BYTE* p1, const BYTE* p2, const BYTE* mask,
   const int p1_pitch, const int p2_pitch, const int mask_pitch,

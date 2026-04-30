@@ -37,12 +37,6 @@ void masked_merge_float_avx2(BYTE* p1, const BYTE* p2, const BYTE* mask,
   int p1_pitch, int p2_pitch, int mask_pitch,
   int width, int height, float opacity_f);
 
-// AVX2 masked merge — width-exact (scalar tail), unaligned loads.
-// opacity is pre-scaled: round(opacity_f * max_pixel_value).
-void masked_merge_avx2(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  int p1_pitch, int p2_pitch, int mask_pitch,
-  int width, int height, int opacity, int bits_per_pixel);
-
 // AVX2 weighted merge — Family 1 (no mask, flat weight, >> 15 shift).
 // weight + invweight == 32768; boundary values (0, 32768) are caller early-outs.
 // Integer: bits_per_pixel in {8, 10, 12, 14, 16}; width in pixels.
@@ -56,6 +50,7 @@ void weighted_merge_float_avx2(BYTE* p1, const BYTE* p2, int p1_pitch, int p2_pi
 // Overlay blend masked getter.
 // Returns the masked_merge_avx2_impl instantiation for the given is_chroma / maskMode combo.
 masked_merge_fn_t* get_overlay_blend_masked_fn_avx2(bool is_chroma, MaskMode maskMode);
+masked_merge_float_fn_t* get_overlay_blend_masked_float_fn_avx2(bool is_chroma, MaskMode maskMode);
 
 // ---------------------------------------------------------------------------
 // Per-row chroma mask preparation (scratch path). Defined in blend_common_avx2.cpp.
@@ -68,5 +63,11 @@ void do_fill_chroma_row_avx2(
   std::vector<pixel_t>& buf, const pixel_t* luma_row,
   int luma_pitch_pixels, int chroma_w, MaskMode mode,
   int opacity_i = 0, int half = 0, MagicDiv magic = {});
+
+template<bool full_opacity = true>
+void do_fill_chroma_row_float_avx2(
+  std::vector<float>& buf, const float* luma_row,
+  int luma_pitch_pixels, int chroma_w, MaskMode mode,
+  float opacity = 0.0f);
 
 #endif // __blend_common_avx2_h

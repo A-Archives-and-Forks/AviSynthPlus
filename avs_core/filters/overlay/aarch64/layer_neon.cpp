@@ -31,25 +31,25 @@
 static void layer_planarrgb_add_neon_3plane(
   BYTE** dstp8, const BYTE** ovrp8, const BYTE* maskp8,
   int dst_pitch, int overlay_pitch, int mask_pitch,
-  int width, int height, int level, int bits_per_pixel)
+  int width, int height, int opacity_i, int bits_per_pixel)
 {
   for (int i = 0; i < 3; i++)
     masked_merge_neon_dispatch<MASK444>(
       dstp8[i], ovrp8[i], maskp8,
       dst_pitch, overlay_pitch, mask_pitch,
-      width, height, level, bits_per_pixel);
+      width, height, opacity_i, bits_per_pixel);
 }
 
 static void layer_planarrgb_add_neon_4plane(
   BYTE** dstp8, const BYTE** ovrp8, const BYTE* maskp8,
   int dst_pitch, int overlay_pitch, int mask_pitch,
-  int width, int height, int level, int bits_per_pixel)
+  int width, int height, int opacity_i, int bits_per_pixel)
 {
   for (int i = 0; i < 4; i++)
     masked_merge_neon_dispatch<MASK444>(
       dstp8[i], ovrp8[i], maskp8,
       dst_pitch, overlay_pitch, mask_pitch,
-      width, height, level, bits_per_pixel);
+      width, height, opacity_i, bits_per_pixel);
 }
 
 void get_layer_planarrgb_add_functions_neon(
@@ -58,6 +58,7 @@ void get_layer_planarrgb_add_functions_neon(
   layer_planarrgb_add_f_c_t** layer_f_fn)
 {
   if (hasAlpha && chroma && bits_per_pixel != 32) {
+    // standard unified masked_merge
     *layer_fn = blendAlpha ? layer_planarrgb_add_neon_4plane : layer_planarrgb_add_neon_3plane;
     return;
   }
@@ -65,29 +66,18 @@ void get_layer_planarrgb_add_functions_neon(
 }
 
 // ---------------------------------------------------------------------------
-// NEON Layer YUV add dispatcher.
-// Selects masked_merge_neon_dispatch<maskMode> for integer hasAlpha=true,
-// use_chroma=true cases; falls through to C templates for float,
-// hasAlpha=false, or use_chroma=false (blend-toward-neutral).
-// subtract is handled by pre-inverting the overlay in Layer::Create.
+// NEON Layer YUV masked add dispatcher — mirrors get_layer_yuv_masked_add_functions_sse41.
+// Determines MaskMode from format and placement, then delegates to the unified
+// get_overlay_blend_masked_fn_neon / get_overlay_blend_masked_float_fn_neon getters.
+// Both integer and float paths are covered.
+// Subtract is handled by pre-inverting the overlay in Layer::Create.
 // ---------------------------------------------------------------------------
-void get_layer_yuv_add_functions_neon(
-  bool is_chroma, bool use_chroma, bool hasAlpha,
+void get_layer_yuv_masked_add_functions_neon(
+  bool is_chroma,
   int placement, VideoInfo& vi, int bits_per_pixel,
-  layer_yuv_add_c_t** layer_fn,
-  layer_yuv_add_f_c_t** layer_f_fn)
+  masked_merge_fn_t**       layer_fn,
+  masked_merge_float_fn_t** layer_f_fn)
 {
-  // Conditions where NEON masked_merge doesn't apply:
-  //  - float (no integer NEON path for float)
-  //  - no alpha mask (blend uses flat weight, not mask; different arithmetic)
-  //  - use_chroma=false with is_chroma=true (blend-toward-neutral, different formula)
-  if (bits_per_pixel == 32 || !hasAlpha || (is_chroma && !use_chroma)) {
-    get_layer_yuv_add_functions(
-      is_chroma, use_chroma, hasAlpha, placement, vi, bits_per_pixel, layer_fn, layer_f_fn);
-    return;
-  }
-
-  // Determine MaskMode from format and placement
   MaskMode maskMode = MASK444;
   if (is_chroma) {
     if (vi.IsYV411())
@@ -100,22 +90,6 @@ void get_layer_yuv_add_functions_neon(
   }
   // is_chroma=false (luma): always MASK444
 
-  // Dispatch to the appropriate NEON instantiation.
-  // For luma (is_chroma=false): always MASK444, no placement.
-  // For chroma (is_chroma=true, use_chroma=true): placement-aware maskMode.
-#define DISPATCH_LUMA_CHROMA_NEON(MaskType) \
-  if (is_chroma) *layer_fn = masked_merge_neon_dispatch<MaskType>; \
-  else           *layer_fn = masked_merge_neon_dispatch<MASK444>;
-
-  switch (maskMode) {
-  case MASK444:          DISPATCH_LUMA_CHROMA_NEON(MASK444)          break;
-  case MASK420:          DISPATCH_LUMA_CHROMA_NEON(MASK420)          break;
-  case MASK420_MPEG2:    DISPATCH_LUMA_CHROMA_NEON(MASK420_MPEG2)    break;
-  case MASK420_TOPLEFT:  DISPATCH_LUMA_CHROMA_NEON(MASK420_TOPLEFT)  break;
-  case MASK422:          DISPATCH_LUMA_CHROMA_NEON(MASK422)          break;
-  case MASK422_MPEG2:    DISPATCH_LUMA_CHROMA_NEON(MASK422_MPEG2)    break;
-  case MASK422_TOPLEFT:  DISPATCH_LUMA_CHROMA_NEON(MASK422_TOPLEFT)  break;
-  case MASK411:          DISPATCH_LUMA_CHROMA_NEON(MASK411)          break;
-  }
-#undef DISPATCH_LUMA_CHROMA_NEON
+  *layer_fn   = get_overlay_blend_masked_fn_neon(is_chroma, maskMode);
+  *layer_f_fn = get_overlay_blend_masked_float_fn_neon(is_chroma, maskMode);
 }

@@ -51,6 +51,7 @@
 
 // masked_merge_avx2_impl<maskMode> — implementation-include, no guards.
 #include "../overlay/intel/masked_merge_avx2_impl.hpp"
+#include "../overlay/intel/blend_common_avx2.h"
 
 #include "../convert/convert_planar.h"
 #include <algorithm>
@@ -278,45 +279,31 @@ template void invert_plane_avx2_f32<true> (uint8_t*, const uint8_t*, int, int, i
  // via masked_merge_avx2_impl.hpp.  Both prepare_effective_mask_for_row_avx2 and
  // prepare_effective_mask_for_row_level_baked_avx2 are therefore visible here.
 #define LAYER_ROWPREP_FN       prepare_effective_mask_for_row_avx2
-#define LAYER_ROWPREP_LEVEL_FN prepare_effective_mask_for_row_level_baked_avx2
 #include "../layer.hpp"
 #undef LAYER_ROWPREP_FN
-#undef LAYER_ROWPREP_LEVEL_FN
 
 
 // Wrapper function that calls the local scoped get_layer_yuv_mul_functions
 // This ensures the AVX2-compiled versions of the functions are selected
 void get_layer_yuv_mul_functions_avx2(
-  bool is_chroma, bool use_chroma, bool hasAlpha,
+  bool is_chroma, bool hasAlpha,
   int placement, VideoInfo& vi, int bits_per_pixel,
   /*out*/layer_yuv_mul_c_t** layer_fn,
   /*out*/layer_yuv_mul_f_c_t** layer_f_fn)
 {
-  get_layer_yuv_mul_functions(is_chroma, use_chroma, hasAlpha, placement, vi, bits_per_pixel, layer_fn, layer_f_fn);
+  get_layer_yuv_mul_functions(is_chroma, hasAlpha, placement, vi, bits_per_pixel, layer_fn, layer_f_fn);
 }
 
 // ---------------------------------------------------------------------------
 // AVX2 Layer add dispatcher.
-// Selects masked_merge_avx2_impl<maskMode> for integer hasAlpha=true,
-// use_chroma=true cases; falls through to C templates for float,
-// hasAlpha=false, or use_chroma=false (blend-toward-neutral).
-// subtract is handled by pre-inverting the overlay in Layer::Create.
 // ---------------------------------------------------------------------------
-void get_layer_yuv_add_functions_avx2(
-  bool is_chroma, bool use_chroma, bool hasAlpha,
+void get_layer_yuv_masked_add_functions_avx2(
+  bool is_chroma, 
   int placement, VideoInfo& vi, int bits_per_pixel,
-  /*out*/layer_yuv_add_c_t** layer_fn,
-  /*out*/layer_yuv_add_f_c_t** layer_f_fn)
+  /*out*/masked_merge_fn_t** layer_fn,
+  /*out*/masked_merge_float_fn_t** layer_f_fn)
 {
-  // Conditions where AVX2 masked_merge doesn't apply:
-  //  - float (no integer AVX2 path for float)
-  //  - no alpha mask (blend uses flat weight, not mask; different arithmetic)
-  //  - use_chroma=false with is_chroma=true (blend-toward-neutral, different formula)
-  if (bits_per_pixel == 32 || !hasAlpha || (is_chroma && !use_chroma)) {
-    get_layer_yuv_add_functions(
-      is_chroma, use_chroma, hasAlpha, placement, vi, bits_per_pixel, layer_fn, layer_f_fn);
-    return;
-  }
+  // only masked merge is left here, simple weighted blend is already handled
 
   // Use the unified (Layer,Overlay) masked merge functions
   // Determine MaskMode from format and placement
@@ -331,30 +318,15 @@ void get_layer_yuv_add_functions_avx2(
     // Is444() / IsY(): stay MASK444
   }
   // is_chroma=false (luma): always MASK444
-
-  // Dispatch to the appropriate AVX2 instantiation.
-  // For luma (is_chroma=false): always MASK444.
-  // For chroma (is_chroma=true, use_chroma=true): placement-aware maskMode.
-#define DISPATCH_LUMA_CHROMA_AVX2(MaskType) \
-  if (is_chroma) *layer_fn = masked_merge_avx2_impl<MaskType>; \
-  else           *layer_fn = masked_merge_avx2_impl<MASK444>;
-
-  switch (maskMode) {
-  case MASK444:          DISPATCH_LUMA_CHROMA_AVX2(MASK444)          break;
-  case MASK420:          DISPATCH_LUMA_CHROMA_AVX2(MASK420)          break;
-  case MASK420_MPEG2:    DISPATCH_LUMA_CHROMA_AVX2(MASK420_MPEG2)    break;
-  case MASK420_TOPLEFT:  DISPATCH_LUMA_CHROMA_AVX2(MASK420_TOPLEFT)  break;
-  case MASK422:          DISPATCH_LUMA_CHROMA_AVX2(MASK422)          break;
-  case MASK422_MPEG2:    DISPATCH_LUMA_CHROMA_AVX2(MASK422_MPEG2)    break;
-  case MASK422_TOPLEFT:  DISPATCH_LUMA_CHROMA_AVX2(MASK422_TOPLEFT)  break;
-  case MASK411:          DISPATCH_LUMA_CHROMA_AVX2(MASK411)          break;
-  }
-#undef DISPATCH_LUMA_CHROMA_AVX2
+  *layer_fn = get_overlay_blend_masked_fn_avx2(is_chroma, maskMode);
+  *layer_f_fn = get_overlay_blend_masked_float_fn_avx2(is_chroma, maskMode);
 }
 
 
+// AVX2 lighten/darken dispatcher.
 void get_layer_planarrgb_lighten_darken_functions_avx2(bool isLighten, bool hasAlpha, bool blendAlpha, int bits_per_pixel, /*out*/layer_planarrgb_lighten_darken_c_t** layer_fn, /*out*/layer_planarrgb_lighten_darken_f_c_t** layer_f_fn) {
-  // FIXME: add AVX2 see layer_rgb32_lighten_darken_avx2
+  // FIXME: add AVX2 see layer_rgb32_lighten_darken_avx2, but use then opacity_i, so
+  // look into the planar_rgb c implementation
   get_layer_planarrgb_lighten_darken_functions(isLighten, hasAlpha, blendAlpha, bits_per_pixel, layer_fn, layer_f_fn);
 }
 
@@ -369,25 +341,25 @@ void get_layer_planarrgb_lighten_darken_functions_avx2(bool isLighten, bool hasA
 static void layer_planarrgb_add_avx2_3plane(
   BYTE** dstp8, const BYTE** ovrp8, const BYTE* maskp8,
   int dst_pitch, int overlay_pitch, int mask_pitch,
-  int width, int height, int level, int bits_per_pixel)
+  int width, int height, int opacity_i, int bits_per_pixel)
 {
   for (int i = 0; i < 3; i++)
     masked_merge_avx2_impl<MASK444>(
       dstp8[i], ovrp8[i], maskp8,
       dst_pitch, overlay_pitch, mask_pitch,
-      width, height, level, bits_per_pixel);
+      width, height, opacity_i, bits_per_pixel);
 }
 
 static void layer_planarrgb_add_avx2_4plane(
   BYTE** dstp8, const BYTE** ovrp8, const BYTE* maskp8,
   int dst_pitch, int overlay_pitch, int mask_pitch,
-  int width, int height, int level, int bits_per_pixel)
+  int width, int height, int opacity_i, int bits_per_pixel)
 {
   for (int i = 0; i < 4; i++)
     masked_merge_avx2_impl<MASK444>(
       dstp8[i], ovrp8[i], maskp8,
       dst_pitch, overlay_pitch, mask_pitch,
-      width, height, level, bits_per_pixel);
+      width, height, opacity_i, bits_per_pixel);
 }
 
 // In layer_avx2.cpp — subtract handled by pre-inverted overlay in Layer::Create.
@@ -396,12 +368,17 @@ void get_layer_planarrgb_add_functions_avx2(
   /*out*/layer_planarrgb_add_c_t** layer_fn,
   /*out*/layer_planarrgb_add_f_c_t** layer_f_fn)
 {
+  // chroma is true: Layer can use the unified masked and weighted blend routines
+  // chroma is false: Layer-specific extension
   // Integer + hasAlpha + chroma=true: dispatch per-plane to masked_merge_avx2_impl (MASK444).
   // chroma=false (blend toward luma) has a different formula — keep C template.
   // float: keep C template (float perf is usually fine; could add later).
-  if (hasAlpha && chroma && bits_per_pixel != 32) {
-    *layer_fn = blendAlpha ? layer_planarrgb_add_avx2_4plane : layer_planarrgb_add_avx2_3plane;
-    return;
+  if (chroma && bits_per_pixel != 32) {
+    if (hasAlpha) {
+      *layer_fn = blendAlpha ? layer_planarrgb_add_avx2_4plane : layer_planarrgb_add_avx2_3plane;
+      return;
+    }
+    // no alpha: standard weighted merge, to be added later.
   }
   get_layer_planarrgb_add_functions(chroma, hasAlpha, blendAlpha, bits_per_pixel, layer_fn, layer_f_fn);
 }
@@ -412,7 +389,7 @@ void get_layer_planarrgb_mul_functions_avx2(
   /*out*/layer_planarrgb_mul_c_t** layer_fn,
   /*out*/layer_planarrgb_mul_f_c_t** layer_f_fn)
 {
-  get_layer_planarrgb_mul_functions(chroma, hasAlpha, blendAlpha, bits_per_pixel, layer_fn, layer_f_fn);
+    get_layer_planarrgb_mul_functions(chroma, hasAlpha, blendAlpha, bits_per_pixel, layer_fn, layer_f_fn);
 }
 
 // ---------------------------------------------------------------------------

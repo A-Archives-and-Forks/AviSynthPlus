@@ -28,16 +28,15 @@
 // masked_merge_sse41_impl<maskMode> — static, SSE4.1.
 // Including here (after intrinsic headers) compiles it with SSE4.1 flags for this TU.
 #include "../overlay/intel/masked_merge_sse41_impl.hpp"
+#include "../overlay/intel/blend_common_sse.h"
 
-// C template dispatcher: get_layer_yuv_add_functions<is_subtract>.
+// C template dispatcher: get_layer_yuv_add_masked_functions<is_subtract>.
 // static functions — this TU's copy gets -msse4.1 auto-vectorization (GCC/Clang).
 // Use SSE4.1 SIMD rowprep variants — masked_rowprep_sse41.hpp is already included above
 // via masked_merge_sse41_impl.hpp.
 #define LAYER_ROWPREP_FN       prepare_effective_mask_for_row_sse41
-#define LAYER_ROWPREP_LEVEL_FN prepare_effective_mask_for_row_level_baked_sse41
 #include "../layer.hpp"
 #undef LAYER_ROWPREP_FN
-#undef LAYER_ROWPREP_LEVEL_FN
 
 // ---------------------------------------------------------------------------
 // Planar RGB add — SSE4.1 per-plane wrappers (mirrors AVX2 counterparts).
@@ -47,25 +46,25 @@
 static void layer_planarrgb_add_sse41_3plane(
   BYTE** dstp8, const BYTE** ovrp8, const BYTE* maskp8,
   int dst_pitch, int overlay_pitch, int mask_pitch,
-  int width, int height, int level, int bits_per_pixel)
+  int width, int height, int opacity_i, int bits_per_pixel)
 {
   for (int i = 0; i < 3; i++)
     masked_merge_sse41_impl<MASK444>(
       dstp8[i], ovrp8[i], maskp8,
       dst_pitch, overlay_pitch, mask_pitch,
-      width, height, level, bits_per_pixel);
+      width, height, opacity_i, bits_per_pixel);
 }
 
 static void layer_planarrgb_add_sse41_4plane(
   BYTE** dstp8, const BYTE** ovrp8, const BYTE* maskp8,
   int dst_pitch, int overlay_pitch, int mask_pitch,
-  int width, int height, int level, int bits_per_pixel)
+  int width, int height, int opacity_i, int bits_per_pixel)
 {
   for (int i = 0; i < 4; i++)
     masked_merge_sse41_impl<MASK444>(
       dstp8[i], ovrp8[i], maskp8,
       dst_pitch, overlay_pitch, mask_pitch,
-      width, height, level, bits_per_pixel);
+      width, height, opacity_i, bits_per_pixel);
 }
 
 void get_layer_planarrgb_add_functions_sse41(
@@ -73,9 +72,26 @@ void get_layer_planarrgb_add_functions_sse41(
   layer_planarrgb_add_c_t** layer_fn,
   layer_planarrgb_add_f_c_t** layer_f_fn)
 {
+  // Integer + hasAlpha + chroma=true: dispatch per-plane to masked_merge_avx2_impl (MASK444).
+  // chroma=false (blend toward luma) has a different formula — keep C template.
+  // float: keep C template (float perf is usually fine; could add later).
   if (hasAlpha && chroma && bits_per_pixel != 32) {
     *layer_fn = blendAlpha ? layer_planarrgb_add_sse41_4plane : layer_planarrgb_add_sse41_3plane;
     return;
+  }
+
+  // chroma is true: Layer can use the unified masked and weighted blend routines
+  // chroma is false: Layer-specific extension
+  // Integer + hasAlpha + chroma=true: dispatch per-plane to masked_merge_avx2_impl (MASK444).
+  // chroma=false (blend toward luma) has a different formula — keep C template.
+  // float: keep C template (float perf is usually fine; could add later).
+  if (bits_per_pixel != 32 && chroma) {
+    if (hasAlpha) {
+      // standard masked merge
+      *layer_fn = blendAlpha ? layer_planarrgb_add_sse41_4plane : layer_planarrgb_add_sse41_3plane;
+      return;
+    }
+    // no alpha: standard weighted merge, to be added later.
   }
   get_layer_planarrgb_add_functions(chroma, hasAlpha, blendAlpha, bits_per_pixel, layer_fn, layer_f_fn);
 }
@@ -204,26 +220,14 @@ void get_layer_packedrgb_blend_functions_sse41(
 
 // ---------------------------------------------------------------------------
 // SSE4.1 Layer add dispatcher.
-// Selects masked_merge_sse41_impl<maskMode> for integer hasAlpha=true,
-// use_chroma=true cases; falls through to C templates for float,
-// hasAlpha=false, or use_chroma=false (blend-toward-neutral).
-// subtract is handled by pre-inverting the overlay in Layer::Create.
 // ---------------------------------------------------------------------------
-void get_layer_yuv_add_functions_sse41(
-  bool is_chroma, bool use_chroma, bool hasAlpha,
+void get_layer_yuv_masked_add_functions_sse41(
+  bool is_chroma,
   int placement, VideoInfo& vi, int bits_per_pixel,
-  layer_yuv_add_c_t** layer_fn,
-  layer_yuv_add_f_c_t** layer_f_fn)
+  /*out*/masked_merge_fn_t** layer_fn,
+  /*out*/masked_merge_float_fn_t** layer_f_fn)
 {
-  // Conditions where SSE4.1 masked_merge doesn't apply:
-  //  - float (no integer SSE4.1 path for float)
-  //  - no alpha mask (blend uses flat weight, not mask; different arithmetic)
-  //  - use_chroma=false with is_chroma=true (blend-toward-neutral, different formula)
-  if (bits_per_pixel == 32 || !hasAlpha || (is_chroma && !use_chroma)) {
-    get_layer_yuv_add_functions(
-      is_chroma, use_chroma, hasAlpha, placement, vi, bits_per_pixel, layer_fn, layer_f_fn);
-    return;
-  }
+  // only masked merge is left here, simple weighted blend is already handled
 
   // Use the unified (Layer,Overlay) masked merge functions
   // Determine MaskMode from format and placement
@@ -239,22 +243,7 @@ void get_layer_yuv_add_functions_sse41(
   }
   // is_chroma=false (luma): always MASK444
 
-  // Dispatch to the appropriate SSE4.1 instantiation.
-  // For luma (is_chroma=false): always MASK444, no placement.
-  // For chroma (is_chroma=true, use_chroma=true): placement-aware maskMode.
-#define DISPATCH_LUMA_CHROMA_SSE41(MaskType) \
-  if (is_chroma) *layer_fn = masked_merge_sse41_impl<MaskType>; \
-  else           *layer_fn = masked_merge_sse41_impl<MASK444>;
+  *layer_fn = get_overlay_blend_masked_fn_sse41(is_chroma, maskMode);
+  *layer_f_fn = get_overlay_blend_masked_float_fn_sse41(is_chroma, maskMode);
 
-  switch (maskMode) {
-  case MASK444:          DISPATCH_LUMA_CHROMA_SSE41(MASK444)          break;
-  case MASK420:          DISPATCH_LUMA_CHROMA_SSE41(MASK420)          break;
-  case MASK420_MPEG2:    DISPATCH_LUMA_CHROMA_SSE41(MASK420_MPEG2)    break;
-  case MASK420_TOPLEFT:  DISPATCH_LUMA_CHROMA_SSE41(MASK420_TOPLEFT)  break;
-  case MASK422:          DISPATCH_LUMA_CHROMA_SSE41(MASK422)          break;
-  case MASK422_MPEG2:    DISPATCH_LUMA_CHROMA_SSE41(MASK422_MPEG2)    break;
-  case MASK422_TOPLEFT:  DISPATCH_LUMA_CHROMA_SSE41(MASK422_TOPLEFT)  break;
-  case MASK411:          DISPATCH_LUMA_CHROMA_SSE41(MASK411)          break;
-  }
-#undef DISPATCH_LUMA_CHROMA_SSE41
 }

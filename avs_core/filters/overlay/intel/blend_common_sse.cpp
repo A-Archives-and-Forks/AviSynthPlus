@@ -342,22 +342,6 @@ void overlay_lighten_sse41(BYTE *p1Y, BYTE *p1U, BYTE *p1V, const BYTE *p2Y, con
 }
 
 
-
-// ---------------------------------------------------------------------------
-// Public Overlay API — MASK444 (mask already at plane resolution).
-// ---------------------------------------------------------------------------
-
-#if defined(GCC) || defined(CLANG)
-__attribute__((__target__("sse4.1")))
-#endif
-void masked_merge_sse41(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  int p1_pitch, int p2_pitch, int mask_pitch,
-  int width, int height, int opacity, int bits_per_pixel)
-{
-  masked_merge_sse41_impl<MASK444>(p1, p2, mask, p1_pitch, p2_pitch, mask_pitch,
-    width, height, opacity, bits_per_pixel);
-}
-
 // ---------------------------------------------------------------------------
 // Family 1: weighted_merge — SSE2 (no mask, flat weight, >> 15 shift)
 // weight + invweight == 32768; boundary values (0, 32768) are caller early-outs.
@@ -484,6 +468,7 @@ void weighted_merge_float_sse2(BYTE* p1, const BYTE* p2, int p1_pitch, int p2_pi
 {
   const float invweight_f = 1.0f - weight_f;
   const auto  v_weight    = _mm_set1_ps(weight_f);
+  const auto  v_invweight = _mm_set1_ps(invweight_f);
   const int   rowsize     = width * 4;
   const int   wMod16      = (rowsize / 16) * 16;
 
@@ -492,8 +477,10 @@ void weighted_merge_float_sse2(BYTE* p1, const BYTE* p2, int p1_pitch, int p2_pi
       auto px1 = _mm_loadu_ps(reinterpret_cast<const float*>(p1 + x));
       auto px2 = _mm_loadu_ps(reinterpret_cast<const float*>(p2 + x));
       // p1 + (p2 - p1) * w  ==  p1*(1-w) + p2*w
-      _mm_storeu_ps(reinterpret_cast<float*>(p1 + x),
-        _mm_add_ps(px1, _mm_mul_ps(_mm_sub_ps(px2, px1), v_weight)));
+      // choose the latter to match C ref
+      auto res = _mm_add_ps(_mm_mul_ps(px1, v_invweight), _mm_mul_ps(px2, v_weight));
+      // old linear interpolation: _mm_add_ps(px1, _mm_mul_ps(_mm_sub_ps(px2, px1), v_weight))
+      _mm_storeu_ps(reinterpret_cast<float*>(p1 + x), res);
     }
     // Scalar tail
     for (int x = wMod16 / 4; x < width; ++x) {
@@ -572,5 +559,55 @@ template void do_fill_chroma_row_sse41<uint8_t,  true> (std::vector<uint8_t>&,  
 template void do_fill_chroma_row_sse41<uint8_t,  false>(std::vector<uint8_t>&,  const uint8_t*,  int, int, MaskMode, int, int, MagicDiv);
 template void do_fill_chroma_row_sse41<uint16_t, true> (std::vector<uint16_t>&, const uint16_t*, int, int, MaskMode, int, int, MagicDiv);
 template void do_fill_chroma_row_sse41<uint16_t, false>(std::vector<uint16_t>&, const uint16_t*, int, int, MaskMode, int, int, MagicDiv);
-// (named *_sse41.cpp so CMake assigns per-file -msse4.1 flags on GCC/Clang).
+
+template<bool full_opacity>
+void do_fill_chroma_row_float_sse41(
+  std::vector<float>& buf, const float* luma_row,
+  int luma_pitch_pixels, int chroma_w, MaskMode mode,
+  float opacity)
+{
+  switch (mode) {
+  case MASK411:
+    prepare_effective_mask_for_row_float_sse41<MASK411, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity); break;
+  case MASK420:
+    prepare_effective_mask_for_row_float_sse41<MASK420, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity); break;
+  case MASK420_MPEG2:
+    prepare_effective_mask_for_row_float_sse41<MASK420_MPEG2, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity); break;
+  case MASK420_TOPLEFT:
+    prepare_effective_mask_for_row_float_sse41<MASK420_TOPLEFT, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity); break;
+  case MASK422:
+    prepare_effective_mask_for_row_float_sse41<MASK422, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity); break;
+  case MASK422_MPEG2:
+    prepare_effective_mask_for_row_float_sse41<MASK422_MPEG2, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity); break;
+  case MASK422_TOPLEFT:
+    prepare_effective_mask_for_row_float_sse41<MASK422_TOPLEFT, full_opacity>(luma_row, luma_pitch_pixels, chroma_w, buf, opacity); break;
+  default: break;
+  }
+}
+
+
+template void do_fill_chroma_row_float_sse41<true>(std::vector<float>&, const float*, int, int, MaskMode, float);
+template void do_fill_chroma_row_float_sse41<false>(std::vector<float>&, const float*, int, int, MaskMode, float);
+
+// and for float:
+masked_merge_float_fn_t* get_overlay_blend_masked_float_fn_sse41(bool is_chroma, MaskMode maskMode)
+{
+#define DISPATCH_OVERLAY_BLEND_FLOAT_SSE41(MaskType) \
+  return is_chroma ? masked_merge_float_sse41_impl<MaskType> \
+                   : masked_merge_float_sse41_impl<MASK444>;
+
+  switch (maskMode) {
+  case MASK444:          DISPATCH_OVERLAY_BLEND_FLOAT_SSE41(MASK444)
+  case MASK420:          DISPATCH_OVERLAY_BLEND_FLOAT_SSE41(MASK420)
+  case MASK420_MPEG2:    DISPATCH_OVERLAY_BLEND_FLOAT_SSE41(MASK420_MPEG2)
+  case MASK420_TOPLEFT:  DISPATCH_OVERLAY_BLEND_FLOAT_SSE41(MASK420_TOPLEFT)
+  case MASK422:          DISPATCH_OVERLAY_BLEND_FLOAT_SSE41(MASK422)
+  case MASK422_MPEG2:    DISPATCH_OVERLAY_BLEND_FLOAT_SSE41(MASK422_MPEG2)
+  case MASK422_TOPLEFT:  DISPATCH_OVERLAY_BLEND_FLOAT_SSE41(MASK422_TOPLEFT)
+  case MASK411:          DISPATCH_OVERLAY_BLEND_FLOAT_SSE41(MASK411)
+  }
+#undef DISPATCH_OVERLAY_BLEND_FLOAT_SSE41
+  return masked_merge_float_sse41_impl<MASK444>; // unreachable
+}
+
 

@@ -73,19 +73,11 @@ void weighted_merge_sse2(BYTE* p1, const BYTE* p2, int p1_pitch, int p2_pitch,
 void weighted_merge_float_sse2(BYTE* p1, const BYTE* p2, int p1_pitch, int p2_pitch,
   int width, int height, float weight_f);
 
-// SSE4.1 masked merge — width-exact (scalar tail), unaligned loads.
-// opacity is pre-scaled: round(opacity_f * max_pixel_value).
-#if defined(GCC) || defined(CLANG)
-__attribute__((__target__("sse4.1")))
-#endif
-void masked_merge_sse41(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  int p1_pitch, int p2_pitch, int mask_pitch,
-  int width, int height, int opacity, int bits_per_pixel);
-
 // Overlay blend masked getter — returns masked_merge_sse41_impl instantiation.
 // is_chroma=false → always MASK444 (luma).
 // is_chroma=true  → placement-aware maskMode (chroma).
 masked_merge_fn_t* get_overlay_blend_masked_fn_sse41(bool is_chroma, MaskMode maskMode);
+masked_merge_float_fn_t* get_overlay_blend_masked_float_fn_sse41(bool is_chroma, MaskMode maskMode);
 
 // ---------------------------------------------------------------------------
 // Per-row chroma mask preparation (scratch path). Defined in blend_common_sse.cpp.
@@ -102,9 +94,10 @@ void do_fill_chroma_row_sse41(
   int luma_pitch_pixels, int chroma_w, MaskMode mode,
   int opacity_i = 0, int half = 0, MagicDiv magic = {});
 
-extern template void do_fill_chroma_row_sse41<uint8_t,  true> (std::vector<uint8_t>&,  const uint8_t*,  int, int, MaskMode, int, int, MagicDiv);
-extern template void do_fill_chroma_row_sse41<uint8_t,  false>(std::vector<uint8_t>&,  const uint8_t*,  int, int, MaskMode, int, int, MagicDiv);
-extern template void do_fill_chroma_row_sse41<uint16_t, true> (std::vector<uint16_t>&, const uint16_t*, int, int, MaskMode, int, int, MagicDiv);
-extern template void do_fill_chroma_row_sse41<uint16_t, false>(std::vector<uint16_t>&, const uint16_t*, int, int, MaskMode, int, int, MagicDiv);
+template<bool full_opacity = true>
+void do_fill_chroma_row_float_sse41(
+  std::vector<float>& buf, const float* luma_row,
+  int luma_pitch_pixels, int chroma_w, MaskMode mode,
+  float opacity = 0.0f);
 
 #endif // __blend_common_sse_h

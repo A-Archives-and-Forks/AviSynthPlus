@@ -46,81 +46,51 @@
 /******************************
  ********* Mode: Blend ********
  ******************************/
-
 // ---------------------------------------------------------------------------
-// Static C wrappers for Overlay blend chroma with non-MASK444 modes.
-// masked_merge_dispatch_c is AVS_FORCEINLINE static — no external address.
-// These thin wrappers give addressable entry points for the getter below.
-// MASK444 chroma reuses masked_merge_c.
+// Overlay blend masked getter — returns masked_merge_avx2_impl instantiation.
+// is_chroma=false -> always MASK444 (luma).
+// is_chroma=true  -> placement-aware maskMode (chroma).
 // ---------------------------------------------------------------------------
-#define BLEND_C_CHROMA_WRAP(suffix, MaskType) \
-  static void masked_merge_c_chroma_##suffix( \
-    BYTE* p1, const BYTE* p2, const BYTE* mask, \
-    int p1_pitch, int p2_pitch, int mask_pitch, \
-    int width, int height, int opacity, int bits_per_pixel) { \
-    masked_merge_dispatch_c<MaskType>( \
-      p1, p2, mask, p1_pitch, p2_pitch, mask_pitch, width, height, opacity, bits_per_pixel); \
-  }
-BLEND_C_CHROMA_WRAP(mask411,           MASK411)
-BLEND_C_CHROMA_WRAP(mask420,           MASK420)
-BLEND_C_CHROMA_WRAP(mask420_mpeg2,     MASK420_MPEG2)
-BLEND_C_CHROMA_WRAP(mask420_topleft,   MASK420_TOPLEFT)
-BLEND_C_CHROMA_WRAP(mask422,           MASK422)
-BLEND_C_CHROMA_WRAP(mask422_mpeg2,     MASK422_MPEG2)
-BLEND_C_CHROMA_WRAP(mask422_topleft,   MASK422_TOPLEFT)
-#undef BLEND_C_CHROMA_WRAP
 
-masked_merge_fn_t* get_overlay_blend_masked_fn_c(bool is_chroma, MaskMode maskMode) {
-  // Luma (is_chroma=false) is always MASK444; reuses masked_merge_c.
-  // Chroma MASK444 also reuses masked_merge_c (subtract=false → is_chroma irrelevant).
-  if (!is_chroma || maskMode == MASK444)
-    return &masked_merge_c;
+masked_merge_fn_t* get_overlay_blend_masked_fn_c(bool is_chroma, MaskMode maskMode)
+{
+#define DISPATCH_OVERLAY_BLEND_C(MaskType) \
+  return is_chroma ? masked_merge_c_impl<MaskType> \
+                   : masked_merge_c_impl<MASK444>;
+
   switch (maskMode) {
-  case MASK411:          return &masked_merge_c_chroma_mask411;
-  case MASK420:          return &masked_merge_c_chroma_mask420;
-  case MASK420_MPEG2:    return &masked_merge_c_chroma_mask420_mpeg2;
-  case MASK420_TOPLEFT:  return &masked_merge_c_chroma_mask420_topleft;
-  case MASK422:          return &masked_merge_c_chroma_mask422;
-  case MASK422_MPEG2:    return &masked_merge_c_chroma_mask422_mpeg2;
-  case MASK422_TOPLEFT:  return &masked_merge_c_chroma_mask422_topleft;
-  default:               return &masked_merge_c; // unreachable
+  case MASK444:          DISPATCH_OVERLAY_BLEND_C(MASK444)
+  case MASK420:          DISPATCH_OVERLAY_BLEND_C(MASK420)
+  case MASK420_MPEG2:    DISPATCH_OVERLAY_BLEND_C(MASK420_MPEG2)
+  case MASK420_TOPLEFT:  DISPATCH_OVERLAY_BLEND_C(MASK420_TOPLEFT)
+  case MASK422:          DISPATCH_OVERLAY_BLEND_C(MASK422)
+  case MASK422_MPEG2:    DISPATCH_OVERLAY_BLEND_C(MASK422_MPEG2)
+  case MASK422_TOPLEFT:  DISPATCH_OVERLAY_BLEND_C(MASK422_TOPLEFT)
+  case MASK411:          DISPATCH_OVERLAY_BLEND_C(MASK411)
   }
+#undef DISPATCH_OVERLAY_BLEND_C
+  return masked_merge_c_impl<MASK444>; // unreachable
 }
 
-// ---------------------------------------------------------------------------
-// Float C wrappers — same structure as integer wrappers above.
-// MASK444 (any is_chroma) reuses masked_merge_float_c.
-// ---------------------------------------------------------------------------
-#define BLEND_FLOAT_C_CHROMA_WRAP(suffix, MaskType) \
-  static void masked_merge_float_c_chroma_##suffix( \
-    BYTE* p1, const BYTE* p2, const BYTE* mask, \
-    int p1_pitch, int p2_pitch, int mask_pitch, \
-    int width, int height, float opacity_f) { \
-    masked_merge_impl_float_c<MaskType>( \
-      p1, p2, mask, p1_pitch, p2_pitch, mask_pitch, width, height, opacity_f); \
-  }
-BLEND_FLOAT_C_CHROMA_WRAP(mask411,           MASK411)
-BLEND_FLOAT_C_CHROMA_WRAP(mask420,           MASK420)
-BLEND_FLOAT_C_CHROMA_WRAP(mask420_mpeg2,     MASK420_MPEG2)
-BLEND_FLOAT_C_CHROMA_WRAP(mask420_topleft,   MASK420_TOPLEFT)
-BLEND_FLOAT_C_CHROMA_WRAP(mask422,           MASK422)
-BLEND_FLOAT_C_CHROMA_WRAP(mask422_mpeg2,     MASK422_MPEG2)
-BLEND_FLOAT_C_CHROMA_WRAP(mask422_topleft,   MASK422_TOPLEFT)
-#undef BLEND_FLOAT_C_CHROMA_WRAP
+// and for float:
+masked_merge_float_fn_t* get_overlay_blend_masked_float_fn_c(bool is_chroma, MaskMode maskMode)
+{
+#define DISPATCH_OVERLAY_BLEND_FLOAT_C(MaskType) \
+  return is_chroma ? masked_merge_float_c_impl<MaskType> \
+                   : masked_merge_float_c_impl<MASK444>;
 
-masked_merge_float_fn_t* get_overlay_blend_masked_float_fn_c(bool is_lumamask_based_chroma, MaskMode maskMode) {
-  if (!is_lumamask_based_chroma || maskMode == MASK444)
-    return &masked_merge_float_c;
   switch (maskMode) {
-  case MASK411:          return &masked_merge_float_c_chroma_mask411;
-  case MASK420:          return &masked_merge_float_c_chroma_mask420;
-  case MASK420_MPEG2:    return &masked_merge_float_c_chroma_mask420_mpeg2;
-  case MASK420_TOPLEFT:  return &masked_merge_float_c_chroma_mask420_topleft;
-  case MASK422:          return &masked_merge_float_c_chroma_mask422;
-  case MASK422_MPEG2:    return &masked_merge_float_c_chroma_mask422_mpeg2;
-  case MASK422_TOPLEFT:  return &masked_merge_float_c_chroma_mask422_topleft;
-  default:               return &masked_merge_float_c; // unreachable
+  case MASK444:          DISPATCH_OVERLAY_BLEND_FLOAT_C(MASK444)
+  case MASK420:          DISPATCH_OVERLAY_BLEND_FLOAT_C(MASK420)
+  case MASK420_MPEG2:    DISPATCH_OVERLAY_BLEND_FLOAT_C(MASK420_MPEG2)
+  case MASK420_TOPLEFT:  DISPATCH_OVERLAY_BLEND_FLOAT_C(MASK420_TOPLEFT)
+  case MASK422:          DISPATCH_OVERLAY_BLEND_FLOAT_C(MASK422)
+  case MASK422_MPEG2:    DISPATCH_OVERLAY_BLEND_FLOAT_C(MASK422_MPEG2)
+  case MASK422_TOPLEFT:  DISPATCH_OVERLAY_BLEND_FLOAT_C(MASK422_TOPLEFT)
+  case MASK411:          DISPATCH_OVERLAY_BLEND_FLOAT_C(MASK411)
   }
+#undef DISPATCH_OVERLAY_BLEND_FLOAT_C
+  return masked_merge_float_c_impl<MASK444>; // unreachable
 }
 
 /*
@@ -160,6 +130,29 @@ static void weighted_merge_impl_c(BYTE* p1, const BYTE* p2,
   }
 }
 
+// merge, handle the two extrems at plane level if it wasn't at clip level
+void weighted_merge_return_a_or_b(BYTE* p1, const BYTE* p2,
+  int p1_pitch, int p2_pitch,
+  int width, int height,
+  int weight, int invweight,
+  int bits_per_pixel)
+{
+  // called either with weight==0, invweight==32768 or the opposite
+  if (weight == 0) return; // keep p1 as-is
+
+  const int pixelsize = bits_per_pixel == 8 ? 1 : bits_per_pixel <= 16 ? 2 : 4;
+  const int rowsize = width * pixelsize;
+
+  if (invweight == 0) {
+    // like bitblt
+    for (int y = 0; y < height; y++) {
+      memcpy(p1, p2, rowsize);
+      p1 += p1_pitch;
+      p2 += p2_pitch;
+    }
+  }
+}
+
 void weighted_merge_c(BYTE* p1, const BYTE* p2,
   int p1_pitch, int p2_pitch,
   int width, int height,
@@ -187,37 +180,6 @@ void weighted_merge_float_c(BYTE* p1, const BYTE* p2,
     p1 += p1_pitch;
     p2 += p2_pitch;
   }
-}
-
-/*************************************************************
- *************** Family 2: masked_merge **********************
- * Implementations are inline templates in blend_common.h.   *
- * Public functions below fix maskMode=MASK444 (mask already *
- * at plane resolution) — the common Overlay path.           *
- * Layer passes other MaskModes via masked_merge_dispatch_c  *
- * or masked_merge_impl_float_c directly.                    *
- ************************************************************/
-
-// Template implementations live in blend_common.h (AVS_FORCEINLINE static).
-// These thin wrappers fix maskMode=MASK444 for the Overlay path where the
-// mask is already at the processed plane's resolution.
-// Layer uses masked_merge_dispatch_c / masked_merge_impl_float_c directly
-// with the appropriate MaskMode.
-
-void masked_merge_c(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  int p1_pitch, int p2_pitch, int mask_pitch,
-  int width, int height, int opacity, int bits_per_pixel)
-{
-  masked_merge_dispatch_c<MASK444>(
-    p1, p2, mask, p1_pitch, p2_pitch, mask_pitch, width, height, opacity, bits_per_pixel);
-}
-
-void masked_merge_float_c(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  int p1_pitch, int p2_pitch, int mask_pitch,
-  int width, int height, float opacity_f)
-{
-  masked_merge_impl_float_c<MASK444>(
-    p1, p2, mask, p1_pitch, p2_pitch, mask_pitch, width, height, opacity_f);
 }
 
 /***************************************

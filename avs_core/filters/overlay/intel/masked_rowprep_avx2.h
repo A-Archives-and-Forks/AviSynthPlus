@@ -4,10 +4,6 @@
 //
 // simd_magic_div_32_avx2 is kept inline here — used inside masked_merge_avx2_impl.hpp
 // hot loops and must remain inlineable within those TUs.
-//
-// masked_rowprep_sse41.h is included for:
-//   - simd_magic_div_32 inline (used by masked_merge_sse41_impl.hpp when included
-//     in AVX2 TUs)
 
 #pragma once
 
@@ -16,8 +12,6 @@
 #else
 #include <immintrin.h>   // AVX2
 #endif
-
-#include "masked_rowprep_sse41.h"   // simd_magic_div_32, fill_mask420_mpeg2_sse41 decl
 
 // ---------------------------------------------------------------------------
 // simd_magic_div_32_avx2
@@ -47,16 +41,15 @@ const pixel_t* prepare_effective_mask_for_row_avx2(
   int half = 0,
   MagicDiv magic = {});
 
+
 // ---------------------------------------------------------------------------
-// prepare_effective_mask_for_row_level_baked_avx2
-// Layer-style baking: result = (avg * level + 1) >> bits_per_pixel.
+// prepare_effective_mask_for_row_avx2
 // Declared here; defined + explicitly instantiated in masked_rowprep_avx2.cpp.
 // ---------------------------------------------------------------------------
-template<MaskMode maskMode, typename pixel_t, bool full_opacity = false>
-const pixel_t* prepare_effective_mask_for_row_level_baked_avx2(
-  const pixel_t* maskp,
+template<MaskMode maskMode, bool full_opacity = true>
+const float* prepare_effective_mask_for_row_float_avx2(
+  const float* maskp,
   int mask_pitch,
   int width,
-  std::vector<pixel_t>& buf,
-  int level = 0,
-  int bits_per_pixel = 8);
+  std::vector<float>& buf,
+  float opacity = 0f);

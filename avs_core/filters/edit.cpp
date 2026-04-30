@@ -733,7 +733,7 @@ PVideoFrame Dissolve::GetFrame(int n, IScriptEnvironment* env)
       get_weighted_merge_float_fn(cpuFlags)(a_data, b_data, a_pitch, b_pitch, width, height, weight);
     } else {
       const int weight_i = (int)(weight * 32768.0f + 0.5f);
-      get_weighted_merge_fn(cpuFlags)(a_data, b_data, a_pitch, b_pitch, width, height, weight_i, 32768 - weight_i, bits_per_pixel);
+      get_weighted_merge_fn(cpuFlags, weight_i)(a_data, b_data, a_pitch, b_pitch, width, height, weight_i, 32768 - weight_i, bits_per_pixel);
     }
   }
   return a;

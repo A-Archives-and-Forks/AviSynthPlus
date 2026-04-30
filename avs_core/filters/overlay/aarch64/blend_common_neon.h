@@ -94,10 +94,29 @@ void overlay_darken_neon(BYTE* p1Y, BYTE* p1U, BYTE* p1V, const BYTE* p2Y, const
 void overlay_lighten_neon(BYTE* p1Y, BYTE* p1U, BYTE* p1V, const BYTE* p2Y, const BYTE* p2U, const BYTE* p2V, int p1_pitch, int p2_pitch, int width, int height);
 
 // ============================================================
-// Overlay blend masked getter.
-// Returns masked_merge_neon_dispatch instantiation for the given is_chroma / maskMode.
-// Overlay always passes MASK444 (internal format is YUV444).
+// Overlay blend masked getters.
+// is_chroma=false -> always MASK444 (luma).
+// is_chroma=true  -> placement-aware maskMode (chroma).
 // ============================================================
-masked_merge_fn_t* get_overlay_blend_masked_fn_neon(bool is_chroma, MaskMode maskMode);
+masked_merge_fn_t*       get_overlay_blend_masked_fn_neon(bool is_chroma, MaskMode maskMode);
+masked_merge_float_fn_t* get_overlay_blend_masked_float_fn_neon(bool is_chroma, MaskMode maskMode);
+
+// ---------------------------------------------------------------------------
+// Per-row chroma mask preparation (scratch path). Defined in blend_common_neon.cpp.
+// full_opacity=true:  spatial averaging only.
+// full_opacity=false: opacity baked in (result = (avg * opacity_i + half) / max).
+// Only uint8_t and uint16_t instantiations are provided for the integer version.
+// ---------------------------------------------------------------------------
+template<typename pixel_t, bool full_opacity = true>
+void do_fill_chroma_row_neon(
+  std::vector<pixel_t>& buf, const pixel_t* luma_row,
+  int luma_pitch_pixels, int chroma_w, MaskMode mode,
+  int opacity_i = 0, int half = 0, MagicDiv magic = {});
+
+template<bool full_opacity = true>
+void do_fill_chroma_row_float_neon(
+  std::vector<float>& buf, const float* luma_row,
+  int luma_pitch_pixels, int chroma_w, MaskMode mode,
+  float opacity = 0.0f);
 
 #endif // __blend_common_neon_h
