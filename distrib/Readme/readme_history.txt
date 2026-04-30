@@ -8,6 +8,74 @@ For online documentation check https://avisynthplus.readthedocs.io/en/latest/
 
 Actual:
 https://avisynthplus.readthedocs.io/en/latest/avisynthdoc/changelist376.html
+20260430 3.7.5.rXXXX (pre 3.7.6)
+--------------------------------
+- Layer: add "mulovr" mode — Overlay-style multiply for YUV(A) formats only (RGB raises an error).
+  The overlay luma (Y) plane drives darkening of all base planes: dark overlay Y pulls base luma toward
+  black and simultaneously desaturates base chroma toward neutral (128d for 8-bit integer, 0.0 for float).
+  Bright overlay Y (max value) leaves the base unchanged.
+  Matches Overlay(mode="multiply") within ±1 LSB for all bit depths and chroma placements.
+  Supports 8-16-bit integer and 32-bit float; all YUV subsampling (Y/411/420/422/444); alpha-aware
+  (YUVA) and non-alpha sources; "placement" parameter for correct 4:2:0 / 4:2:2 mask downsampling.
+  For greyscale (Y-only) clips, there are no chroma planes to desaturate so the luma formula is
+  numerically equivalent to Layer "mul" (within ±1 LSB from integer rounding paths).
+  Implemented as a two-pass function like "lighten"/"darken": pass 1 handles chroma using
+  spatially-averaged overlay Y; pass 2 handles luma at full resolution.
+- Overlay/Layer "blend": remove stale constraint that limited float masked-merge dispatch to MASK444 only.
+  All MaskModes (MASK420/MPEG2/TOPLEFT, MASK422/MPEG2/TOPLEFT, MASK411) are now dispatched to AVX2,
+  SSE4.1, NEON, or C fallback — matching the already-full integer dispatch path.
+- Overlay/Layer "blend": float chroma-mask row preparation (scratch path) now dispatches to SIMD helpers
+  (AVX2, SSE4.1, NEON) before falling back to C, matching the integer scratch path pattern.
+- Merge/AveragePlane/MaskedMerge: add AVX2 float weighted-merge implementation; remove obsolete iSSE
+  code; make memory loads unaligned so the routine is safely callable as a building block from Overlay/Layer.
+- Fix of a recent regression: MSVC non-SIMD C reference float stride fix used by debug C implementation of 
+  float vertical resampler.
+
+20260425 3.7.5.rXXXX (pre 3.7.6)
+--------------------------------
+- Layer: remove legacy MMX/iSSE (x86-only) code paths from all YUV modes.
+  Replace hand-rolled integer min/max with std::min/std::max.
+- Fix: Text filter crash when input contains a zero-length line (e.g. Text("\n") with an empty
+  first line). Line length was not checked before accessing line data.
+
+20260422 3.7.5.rXXXX (pre 3.7.6)
+--------------------------------
+- Refactor/optimize: Unify three separate masked-merge implementations that existed independently
+  in Layer, Overlay, and Merge into a single shared kernel family parameterized on MaskMode and
+  pixel type (masked_merge_c, masked_merge_sse41_impl, masked_merge_avx2_impl, masked_merge_neon).
+  Layer's special two-pass modes (lighten, darken, mulovr) retain their own implementations.
+- Layer/Overlay/Merge: SIMD precalculation of chroma-placement-corrected mask rows for subsampled
+  formats (4:2:0, 4:2:2, 4:1:1). SSE4.1, AVX2, and NEON handle all placement variants
+  (MASK420/MPEG2/TOPLEFT, MASK422/MPEG2/TOPLEFT, MASK411), enabling full SIMD throughput in the
+  main blend loop for non-444 sources. Previously the main loop ran C-scalar for these formats.
+- Layer: add "top_left" option for the "placement" parameter — HEVC/AV1 left+top co-sited chroma
+  placement (point-sample, no filtering, fastest). Affects "mul", "add", "subtract", "lighten",
+  "darken", and "mulovr" modes with 4:2:0 / 4:2:2 sources.
+- Overlay "blend": add "placement" parameter for correct luma-mask downsampling in 4:2:0 and 4:2:2
+  clips. Values: "mpeg2" (default, triangle filter), "mpeg1" (box filter), "top_left" (point-sample).
+- Accuracy: integer masked merge now uses magic-number division ("magicdiv") for exact per-element
+  results at all bit depths (8-16 bit), replacing the approximation from arithmetic right-shift.
+  Plain weighted (non-masked) merge uses the same 15-bit arithmetic in C as in SIMD, eliminating
+  subtle C/SIMD output divergence.
+- Optimize: add AVX2 path for flat-weight (non-masked) 32-bit float weighted merge.
+- Layer: packed RGB "add"/"subtract" cleanup after the refactoring — fix minor inconsistencies,
+  clarify comments, remove dead code paths.
+- Invert: add proper AVX2 and SSE2 SIMD paths for planar luma and chroma.
+  (An earlier attempt noted "no really gain"; this is the full vectorized implementation.)
+- Optimize ExtractX (ExtractR/G/B/A/Y/U/V): handle packed RGB formats directly instead of routing
+  through a PlanarRGB(A) conversion, avoiding an unnecessary frame copy.
+- ConvertBits: restructure integer-to-integer depth-reducing C loop to be more optimizer-friendly,
+  enabling auto-vectorization by the compiler.
+- Optimize: PlanarRGB(A) -> RGB32/RGB64: add AVX2 conversion path.
+
+20260401 3.7.5.rXXXX (pre 3.7.6)
+--------------------------------
+- CMakeLists: add option to pre-supply external DevIL library path and include directory
+  (-DDEVIL_LIBRARY / -DDEVIL_INCLUDE_DIR) for environments where DevIL is not in the default
+  search path.
+- CMakeLists: ensure all compiler parameter settings (warnings, compile options) are applied to
+  plugin sub-projects as well as the core library. Previously some flags were missing in plugins.
+
 20260331 3.7.5.r45XX (pre 3.7.6)
 --------------------------------
 - SetFilterProp: new conditional form — inject a frame property only when a named call argument
@@ -46,7 +114,7 @@ https://avisynthplus.readthedocs.io/en/latest/avisynthdoc/changelist376.html
 20260305 3.7.5.r4549 (pre 3.7.6)
 --------------------------------
 - Fix: memory leak in Subframe/MakePropertyWritable after static-frame sources (ColorBars, BlankClip)
-- any->YUV conversions (See https://avisynthplus.readthedocs.io/en/latest/avisynthdoc/corefilters/convert.html`.
+- any->YUV conversions (See https://avisynthplus.readthedocs.io/en/latest/avisynthdoc/corefilters/convert.html).
   - accept bits and quality parameters, similar to ConvertToPlanarRGB
   - the legacy 8-bit-named functions (``ConvertToYV12``, ``ConvertToYV16``, 
     ``ConvertToYV24``) allowing high-depth sources.
@@ -61,7 +129,7 @@ https://avisynthplus.readthedocs.io/en/latest/avisynthdoc/changelist376.html
     frame properties were not read from YV12 source frames and not written to YUY2 output frames 
     in the old legacy direct conversion path.
   - Fix: "ConvertToYUY2": SSE2 interlaced upsampling used wrong weighting direction, differing from the C reference implementation.
-- Update https://avisynthplus.readthedocs.io/en/latest/avisynthdoc/corefilters/convert.html`
+- Update https://avisynthplus.readthedocs.io/en/latest/avisynthdoc/corefilters/convert.html
   - matrix syntax
   - ConvertToYUY2
   - ``bits`` and ``quality`` parameters

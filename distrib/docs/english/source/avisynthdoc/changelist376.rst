@@ -115,6 +115,21 @@ Additions, changes
   Stop using direct rgb-yv24 conversions (16 bits were already converted for long time).
 - Add :doc:`ColorBarsUHD <./corefilters/colorbarsuhd>` ITU-R BT.2111-3 (05/2025) with three signal variants:
   HLG narrow range (mode=0), PQ narrow range (mode=1) and PQ full range (mode=2)
+- "Layer": add ``"mulovr"`` op — Overlay-style multiply for YUV(A) formats only (RGB raises an error).
+  The overlay luma (Y) plane drives darkening of all base planes: dark overlay Y pulls base luma toward
+  black and simultaneously desaturates base chroma toward neutral (128 for 8-bit integer, 0.0 for float).
+  Bright overlay Y (max value) leaves the base unchanged.  Matches ``Overlay(mode="multiply")`` within
+  ±1 LSB for all bit depths and all chroma placements.  Supports 8–16-bit integer and 32-bit float; all
+  YUV subsampling (Y, 4:1:1, 4:2:0, 4:2:2, 4:4:4); alpha-aware (YUVA) and non-alpha sources.
+  Uses a two-pass structure like "lighten"/"darken": pass 1 processes chroma using spatially-averaged
+  overlay Y; pass 2 processes luma at full resolution.  The ``"placement"`` parameter is respected for
+  correct 4:2:0 / 4:2:2 mask downsampling.
+  See :doc:`Layer <./corefilters/layer>`.
+- "Layer": add ``"top_left"`` option for the ``"placement"`` parameter — HEVC/AV1 left+top co-sited
+  chroma (point-sample, fastest).  Affects ``"mul"``, ``"add"``, ``"subtract"``, ``"lighten"``,
+  ``"darken"``, and ``"mulovr"`` modes with 4:2:0 / 4:2:2 sources.
+- "Overlay" ``"blend"`` mode: add ``"placement"`` parameter for correct luma-mask-to-chroma
+  downsampling in 4:2:0 and 4:2:2 clips.  Values: ``"mpeg2"`` (default), ``"mpeg1"``, ``"top_left"``.
 
 
 Build environment, Interface
@@ -170,6 +185,10 @@ Build environment, Interface
     The fix: converts global ``add_definitions("/D ...")`` and other option string magics into per-target ``target_compile_definitions()``
     and ``target_compile_options()``. Thus removing the accidental injection of ``${CMAKE_CXX_FLAGS}`` 
     into ``add_compile_options()``, and prevents the WIN32 macro redefinition.
+- CMakeLists: add option to pre-supply external DevIL library path and include directory
+  (``-DDEVIL_LIBRARY`` / ``-DDEVIL_INCLUDE_DIR``).
+- CMakeLists: apply compiler parameter settings (warnings, compile flags) to all plugin
+  sub-projects in addition to the core library.
 
 
 Bugfixes
@@ -239,10 +258,11 @@ Bugfixes
 - Change video-framebuffer over-allocation from 16 to 64 bytes. Allocate 64 bytes more than needed for 
   video frame buffer in order to be able to read 64 bytes safely with AVX512 without risking access violation 
   on the last pixels of the frame.
-- Fix: The `Animate()` function now explicitly clamps interpolated values to ensure they remain 
-  strictly between the start and end range. Due to the high precision of 64-bit `double` introduced 
-  in v3.7.5, intermediate calculations could slightly exceed the boundary (e.g., 360.00000000000006 
+- Fix: The `Animate()` function now explicitly clamps interpolated values to ensure they remain
+  strictly between the start and end range. Due to the high precision of 64-bit `double` introduced
+  in v3.7.5, intermediate calculations could slightly exceed the boundary (e.g., 360.00000000000006
   when interpolating from 0 to 360.0 in 564 steps), requiring this clamp to prevent out-of-range errors.
+- Fix: ``Text`` filter crash when input contains a zero-length line (e.g. ``Text("\n")``).
 
 
 Optimizations
@@ -277,6 +297,23 @@ Optimizations
 - add NEON optimizatons for Overlay blend
 - (filter graph) avoid MTGuard and CacheGuard creation if a filter returns one of its clip parameter unaltered.
 - Add some avx2 stuff to Invert (no really gain, filter is too simple) and some Layer subfilter.
+- "Layer", "Overlay", "Merge": unify three separate masked-merge kernel families into shared
+  ``masked_merge_{c,sse41,avx2,neon}`` templates parameterized on ``MaskMode`` and pixel type.
+  SIMD precalculation of chroma-placement-corrected mask rows (SSE4.1, AVX2, NEON) for all
+  subsampled formats (4:2:0, 4:2:2, 4:1:1) enables full SIMD throughput in the main blend loop
+  for non-444 sources.  Accuracy: integer masked merge uses magic-number division for exact
+  per-element results at all bit depths; plain weighted merge uses the same 15-bit arithmetic
+  in C as in SIMD, eliminating C/SIMD parity issues.  AVX2 flat-weight float weighted merge added.
+- "Merge" ``AveragePlane`` / ``MaskedMerge``: add AVX2 float weighted-merge path; remove obsolete
+  iSSE code; make memory loads unaligned so the routine is safely reusable from Overlay/Layer.
+- "Layer": remove legacy MMX/iSSE (x86-only) code paths; replace hand-rolled min/max with
+  ``std::min`` / ``std::max``.
+- "Invert": add proper AVX2 and SSE2 SIMD paths for planar luma and chroma.
+- ``ExtractX`` (``ExtractR/G/B/A/Y/U/V``): handle packed RGB formats directly, avoiding a
+  PlanarRGB(A) conversion round-trip.
+- "ConvertBits": restructure integer-to-integer depth-reducing C loop to be more
+  auto-vectorization-friendly.
+- ``PlanarRGB(A)`` → ``RGB32`` / ``RGB64``: add AVX2 conversion path.
 
 Documentation
 ~~~~~~~~~~~~~
@@ -312,12 +349,15 @@ Documentation
   See :ref:`Ubuntu->Windows mingw crosscompilation<compiling_avsplus_crosscompiling2>`
 - Add :doc:`ColorBarsUHD <./corefilters/colorbarsuhd>`
 - Add :doc:`SetFilterProp / SetFilterPropPassthrough <./corefilters/setfilterprop>`
+- Update :doc:`Layer <./corefilters/layer>` with ``"mulovr"`` mode, ``"top_left"`` placement
+  option, and related chroma-placement refactoring notes.
+- Update :doc:`Overlay <./corefilters/overlay>` with ``"placement"`` parameter for ``"blend"`` mode.
 
 
 Please report bugs at `github AviSynthPlus page`_ - or - `Doom9's AviSynth+
 forum`_
 
-$Date: 2026/03/30 12:00:00 $
+$Date: 2026/04/30 12:00:00 $
 
 .. _github AviSynthPlus page:
     https://github.com/AviSynth/AviSynthPlus
