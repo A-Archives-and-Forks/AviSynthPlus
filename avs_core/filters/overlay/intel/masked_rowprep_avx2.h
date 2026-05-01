@@ -52,4 +52,4 @@ const float* prepare_effective_mask_for_row_float_avx2(
   int mask_pitch,
   int width,
   std::vector<float>& buf,
-  float opacity = 0f);
+  float opacity = 0.0f);
