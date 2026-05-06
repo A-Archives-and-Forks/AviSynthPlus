@@ -2003,12 +2003,20 @@ Layer::Layer(PClip _child1, PClip _child2, PClip _mask_child, const char _op[], 
   else if (!strengthSpecified)
     opacity = 1.0f;
 
+  if (opacity < 0.0f) opacity = 0.0f;
+  if (opacity > 1.0f) opacity = 1.0f;
+
+  constexpr bool snap_offsets_to_chroma = false;
+  // Can be turned on for legacy subsampling-friendly behaviour (pre-3.7.6 Layer snapped the offsets)
+  // Chroma width calculation is already made ready to accept odd positions.
+  // "Overlay" does not snap.
+  if (snap_offsets_to_chroma) {
   if ((vi.IsYUV() || vi.IsYUVA()) && !vi.IsY()) {
     // make offsets subsampling friendly
     ofsX = ofsX & ~((1 << vi.GetPlaneWidthSubsampling(PLANAR_U)) - 1);
     ofsY = ofsY & ~((1 << vi.GetPlaneHeightSubsampling(PLANAR_U)) - 1);
   }
-
+  }
   // For the sake of completeness, packed rgb formats still exist, but for most modes they are converted to planar RGB.
   if (vi.IsRGB32() || vi.IsRGB64() || vi.IsRGB24() || vi.IsRGB48())
     ofsY = vi.height - vi2.height - ofsY; // packed RGB is upside down
@@ -2660,8 +2668,18 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
 
         const int ws = vi.GetPlaneWidthSubsampling(plane);
         const int hs = vi.GetPlaneHeightSubsampling(plane);
-        const int currentwidth = width >> ws;
-        const int currentheight = height >> hs;
+
+        // For chroma planes, the processing width/height is reduced by the subsampling factor.
+        // old formula: assuming that xdest and ydest was already snapped to the chroma grid
+        //const int currentwidth  = width  >> ws;
+        //const int currentheight = height >> hs;
+
+        // Ceiling formula: account for odd xdest/ydest so the last partial chroma
+        // column/row is included when xdest (or ydest) is misaligned to the chroma grid.
+        const int ws_mask = (1 << ws) - 1;
+        const int hs_mask = (1 << hs) - 1;
+        const int currentwidth = (ws > 0) ? ((xdest & ws_mask) + width + ws_mask) >> ws : width;
+        const int currentheight = (hs > 0) ? ((ydest & hs_mask) + height + hs_mask) >> hs : height;
 
         BYTE* src1p = src1->GetWritePtr(plane) + src1_pitch * (ydest >> hs) + (xdest >> ws) * pixelsize; // destination
         const BYTE* src2p = src2->GetReadPtr(plane) + src2_pitch * (ysrc >> hs) + (xsrc >> ws) * pixelsize; // source plane

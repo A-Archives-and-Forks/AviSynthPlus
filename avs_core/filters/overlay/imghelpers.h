@@ -54,6 +54,8 @@ private:
 
   int fake_w;
   int fake_h;
+  int fake_x_accum; // cumulative luma x offset from all SubFrame calls
+  int fake_y_accum; // cumulative luma y offset from all SubFrame calls
   const int _w;
   const int _h;
   const int _bits_per_pixel;
@@ -298,7 +300,15 @@ public:
 
     fake_w = new_w;
     fake_h = new_h;
+    fake_x_accum += x;
+    fake_y_accum += y;
   }
+
+  // Accumulated luma x/y offset from all SubFrame calls since last ResetFake.
+  // Used by blend functions to compute the correct chroma column/row count via
+  // ceiling division when the starting position is not chroma-grid-aligned.
+  int xAccum() const { return return_original ? 0 : fake_x_accum; }
+  int yAccum() const { return return_original ? 0 : fake_y_accum; }
 
   bool IsSizeZero() {
     if (w()<=0) return true;
@@ -317,6 +327,8 @@ public:
       fakePlanes[i] = origPlanes[i];
     fake_w = _w;
     fake_h = _h;
+    fake_x_accum = 0;
+    fake_y_accum = 0;
   }
 
   ~ImageOverlayInternal() {

@@ -358,8 +358,10 @@ void OL_BlendImage::BlendImageMask(ImageOverlayInternal* base, ImageOverlayInter
         else if (vi_internal.Is422())
           chroma_maskMode = (placement == PLACEMENT_MPEG1) ? MASK422 : (placement == PLACEMENT_TOPLEFT) ? MASK422_TOPLEFT : MASK422_MPEG2;
 
-        const int chroma_w = w >> base->xSubSamplingShifts[1];
-        const int chroma_h = h >> base->ySubSamplingShifts[1];
+        const int xws = base->xSubSamplingShifts[1];
+        const int yhs = base->ySubSamplingShifts[1];
+        const int chroma_w = (xws > 0) ? ((base->xAccum() & ((1 << xws) - 1)) + w + (1 << xws) - 1) >> xws : w;
+        const int chroma_h = (yhs > 0) ? ((base->yAccum() & ((1 << yhs) - 1)) + h + (1 << yhs) - 1) >> yhs : h;
         const int luma_mask_pitch_floats = mask->GetPitchByIndex(0) / (int)sizeof(float);
         const int luma_mask_advance = (chroma_maskMode == MASK420 || chroma_maskMode == MASK420_MPEG2 || chroma_maskMode == MASK420_TOPLEFT)
                                       ? luma_mask_pitch_floats * 2 : luma_mask_pitch_floats;
@@ -426,9 +428,13 @@ void OL_BlendImage::BlendImageMask(ImageOverlayInternal* base, ImageOverlayInter
     // Normal path: greymask=false or non-subsampled — mask already at plane resolution.
     for (int p = planeindex_from; p <= planeindex_to; p++) {
       masked_merge_float_fn_t* fn = (p == 0 || !use_chroma_fn) ? blend_fn_luma : blend_fn_chroma;
+      const int xws_p = base->xSubSamplingShifts[p];
+      const int yhs_p = base->ySubSamplingShifts[p];
+      const int plane_w = (xws_p > 0) ? ((base->xAccum() & ((1 << xws_p) - 1)) + w + (1 << xws_p) - 1) >> xws_p : w;
+      const int plane_h = (yhs_p > 0) ? ((base->yAccum() & ((1 << yhs_p) - 1)) + h + (1 << yhs_p) - 1) >> yhs_p : h;
       fn(base->GetPtrByIndex(p), overlay->GetPtrByIndex(p), mask->GetPtrByIndex(p),
         base->GetPitchByIndex(p), overlay->GetPitchByIndex(p), mask->GetPitchByIndex(p),
-        w >> base->xSubSamplingShifts[p], h >> base->ySubSamplingShifts[p], opacity_f);
+        plane_w, plane_h, opacity_f);
     }
   }
   else {
@@ -458,8 +464,10 @@ void OL_BlendImage::BlendImageMask(ImageOverlayInternal* base, ImageOverlayInter
         else if (vi_internal.Is422())
           chroma_maskMode = (placement == PLACEMENT_MPEG1) ? MASK422 : (placement == PLACEMENT_TOPLEFT) ? MASK422_TOPLEFT : MASK422_MPEG2;
 
-        const int chroma_w = w >> base->xSubSamplingShifts[1];
-        const int chroma_h = h >> base->ySubSamplingShifts[1];
+        const int xws = base->xSubSamplingShifts[1];
+        const int yhs = base->ySubSamplingShifts[1];
+        const int chroma_w = (xws > 0) ? ((base->xAccum() & ((1 << xws) - 1)) + w + (1 << xws) - 1) >> xws : w;
+        const int chroma_h = (yhs > 0) ? ((base->yAccum() & ((1 << yhs) - 1)) + h + (1 << yhs) - 1) >> yhs : h;
         const int luma_mask_pitch_pixels = mask->GetPitchByIndex(0) / (int)sizeof(pixel_t);
         const int luma_mask_advance = (chroma_maskMode == MASK420 || chroma_maskMode == MASK420_MPEG2 || chroma_maskMode == MASK420_TOPLEFT)
                                       ? luma_mask_pitch_pixels * 2 : luma_mask_pitch_pixels;
@@ -531,9 +539,13 @@ void OL_BlendImage::BlendImageMask(ImageOverlayInternal* base, ImageOverlayInter
     // Normal path: greymask=false or non-subsampled — mask already at plane resolution.
     for (int p = planeindex_from; p <= planeindex_to; p++) {
       masked_merge_fn_t* fn = (p == 0 || !use_chroma_fn) ? blend_fn_luma : blend_fn_chroma;
+      const int xws_p = base->xSubSamplingShifts[p];
+      const int yhs_p = base->ySubSamplingShifts[p];
+      const int plane_w = (xws_p > 0) ? ((base->xAccum() & ((1 << xws_p) - 1)) + w + (1 << xws_p) - 1) >> xws_p : w;
+      const int plane_h = (yhs_p > 0) ? ((base->yAccum() & ((1 << yhs_p) - 1)) + h + (1 << yhs_p) - 1) >> yhs_p : h;
       fn(base->GetPtrByIndex(p), overlay->GetPtrByIndex(p), mask->GetPtrByIndex(p),
         base->GetPitchByIndex(p), overlay->GetPitchByIndex(p), mask->GetPitchByIndex(p),
-        w >> base->xSubSamplingShifts[p], h >> base->ySubSamplingShifts[p], opacity_i, bits_per_pixel);
+        plane_w, plane_h, opacity_i, bits_per_pixel);
     }
   }
 }
@@ -566,7 +578,11 @@ void OL_BlendImage::BlendImage(ImageOverlayInternal* base, ImageOverlayInternal*
   // opacity == 0 was also an early-out case
   if (opacity == 256) {
     for (int p = planeindex_from; p <= planeindex_to; p++) {
-      env->BitBlt(base->GetPtrByIndex(p), base->GetPitchByIndex(p), overlay->GetPtrByIndex(p), overlay->GetPitchByIndex(p), (w >> base->xSubSamplingShifts[p]) * pixelsize, h >> base->ySubSamplingShifts[p]);
+      const int xws_p = base->xSubSamplingShifts[p];
+      const int yhs_p = base->ySubSamplingShifts[p];
+      const int plane_w = (xws_p > 0) ? ((base->xAccum() & ((1 << xws_p) - 1)) + w + (1 << xws_p) - 1) >> xws_p : w;
+      const int plane_h = (yhs_p > 0) ? ((base->yAccum() & ((1 << yhs_p) - 1)) + h + (1 << yhs_p) - 1) >> yhs_p : h;
+      env->BitBlt(base->GetPtrByIndex(p), base->GetPitchByIndex(p), overlay->GetPtrByIndex(p), overlay->GetPitchByIndex(p), plane_w * pixelsize, plane_h);
     }
   }
   else {
@@ -607,11 +623,15 @@ void OL_BlendImage::BlendImage(ImageOverlayInternal* base, ImageOverlayInternal*
       env->ThrowError("Blend: no valid internal function");
 
     for (int p = planeindex_from; p <= planeindex_to; p++) {
+      const int xws_p = base->xSubSamplingShifts[p];
+      const int yhs_p = base->ySubSamplingShifts[p];
+      const int plane_w = (xws_p > 0) ? ((base->xAccum() & ((1 << xws_p) - 1)) + w + (1 << xws_p) - 1) >> xws_p : w;
+      const int plane_h = (yhs_p > 0) ? ((base->yAccum() & ((1 << yhs_p) - 1)) + h + (1 << yhs_p) - 1) >> yhs_p : h;
       // no mask ptr
       blend_fn(
         base->GetPtrByIndex(p), overlay->GetPtrByIndex(p), nullptr,
         base->GetPitchByIndex(p), overlay->GetPitchByIndex(p), 0,
-        (w >> base->xSubSamplingShifts[p]), h >> base->ySubSamplingShifts[p], opacity_f,
+        plane_w, plane_h, opacity_f,
         bits_per_pixel);
     }
 
