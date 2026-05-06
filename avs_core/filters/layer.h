@@ -85,7 +85,7 @@ using layer_yuv_mul_f_c_t = void(BYTE* dstp8, const BYTE* ovrp8, const BYTE* mas
 // ovrp8: overlay Y plane only (UV planes of the overlay are not used).
 // maskp8: overlay alpha plane at luma resolution (nullptr when has_alpha=false).
 // integer 8-16 bits version
-using layer_yuv_mulspec_c_t = void(
+using layer_yuv_mulovr_c_t = void(
   BYTE* dstp8, BYTE* dstp8_u, BYTE* dstp8_v,
   const BYTE* ovrp8,
   const BYTE* maskp8,
@@ -95,7 +95,7 @@ using layer_yuv_mulspec_c_t = void(
   int width, int height, int level, int bits_per_pixel);
 
 // 32 bit float version
-using layer_yuv_mulspec_f_c_t = void(
+using layer_yuv_mulovr_f_c_t = void(
   BYTE* dstp8, BYTE* dstp8_u, BYTE* dstp8_v,
   const BYTE* ovrp8,
   const BYTE* maskp8,

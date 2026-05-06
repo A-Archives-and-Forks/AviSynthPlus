@@ -2011,20 +2011,15 @@ Layer::Layer(PClip _child1, PClip _child2, PClip _mask_child, const char _op[], 
   // Chroma width calculation is already made ready to accept odd positions.
   // "Overlay" does not snap.
   if (snap_offsets_to_chroma) {
-  if ((vi.IsYUV() || vi.IsYUVA()) && !vi.IsY()) {
-    // make offsets subsampling friendly
-    ofsX = ofsX & ~((1 << vi.GetPlaneWidthSubsampling(PLANAR_U)) - 1);
-    ofsY = ofsY & ~((1 << vi.GetPlaneHeightSubsampling(PLANAR_U)) - 1);
-  }
+    if ((vi.IsYUV() || vi.IsYUVA()) && !vi.IsY()) {
+      // make offsets subsampling friendly
+      ofsX = ofsX & ~((1 << vi.GetPlaneWidthSubsampling(PLANAR_U)) - 1);
+      ofsY = ofsY & ~((1 << vi.GetPlaneHeightSubsampling(PLANAR_U)) - 1);
+    }
   }
   // For the sake of completeness, packed rgb formats still exist, but for most modes they are converted to planar RGB.
   if (vi.IsRGB32() || vi.IsRGB64() || vi.IsRGB24() || vi.IsRGB48())
     ofsY = vi.height - vi2.height - ofsY; // packed RGB is upside down
-  else if ((vi.IsYUV() || vi.IsYUVA()) && !vi.IsY()) {
-    // make offsets subsampling friendly
-    ofsX = ofsX & ~((1 << vi.GetPlaneWidthSubsampling(PLANAR_U)) - 1);
-    ofsY = ofsY & ~((1 << vi.GetPlaneHeightSubsampling(PLANAR_U)) - 1);
-  }
 
   xdest = (ofsX < 0) ? 0 : ofsX;
   ydest = (ofsY < 0) ? 0 : ofsY;
@@ -2588,8 +2583,7 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
 
       // target alpha channel is unaffected
       // Until we support providing a separate mask clip, we pass A plane pointer for overlay alpha
-      //BYTE* src1p_a = hasAlpha ? src1->GetWritePtr(PLANAR_Y) + src1_pitch * (ydest)+(xdest)* pixelsize : nullptr;
-      const BYTE* maskp = hasAlpha ? src2->GetReadPtr(PLANAR_A) + src2_pitch * (ysrc)+(xsrc)*pixelsize : nullptr; // overlay alpha
+      const BYTE* maskp = hasAlpha ? src2->GetReadPtr(PLANAR_A) + src2_pitch * ysrc + xsrc * pixelsize : nullptr; // overlay alpha
       const int mask_pitch = src2->GetPitch(PLANAR_A);
 
       // called only once, for all planes
@@ -2641,9 +2635,9 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
       const BYTE* maskp      = hasAlpha ? src2->GetReadPtr(PLANAR_A) + src2_pitch * ysrc + xsrc * pixelsize : nullptr;
       const int   mask_pitch = hasAlpha ? src2->GetPitch(PLANAR_A) : 0;
 
-      layer_yuv_mulspec_c_t*   layer_fn   = nullptr;
-      layer_yuv_mulspec_f_c_t* layer_f_fn = nullptr;
-      get_layer_yuv_mulspec_functions(hasAlpha, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
+      layer_yuv_mulovr_c_t*   layer_fn   = nullptr;
+      layer_yuv_mulovr_f_c_t* layer_f_fn = nullptr;
+      get_layer_yuv_mulovr_functions(hasAlpha, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
 
       if (layer_fn)
         layer_fn(src1p, src1p_u, src1p_v, src2p, maskp,
@@ -2684,7 +2678,7 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
         BYTE* src1p = src1->GetWritePtr(plane) + src1_pitch * (ydest >> hs) + (xdest >> ws) * pixelsize; // destination
         const BYTE* src2p = src2->GetReadPtr(plane) + src2_pitch * (ysrc >> hs) + (xsrc >> ws) * pixelsize; // source plane
 
-        const BYTE* maskp = hasAlpha ? src2->GetReadPtr(PLANAR_A) + src2_pitch * (ysrc >> hs) + (xsrc >> ws) * pixelsize : nullptr; // alpha plane from Overlay
+        const BYTE* maskp = hasAlpha ? src2->GetReadPtr(PLANAR_A) + src2->GetPitch(PLANAR_A) * (ysrc) + (xsrc) * pixelsize : nullptr; // alpha plane from Overlay
         const int mask_pitch = hasAlpha ? src2->GetPitch(PLANAR_A) : 0;
 
         const bool is_chroma = plane != PLANAR_Y;

@@ -661,7 +661,7 @@ static void get_layer_yuv_mul_functions(
 // ---------------------------------------------------------------------------
 
 template<MaskMode maskMode, typename pixel_t, bool lumaonly, bool has_alpha>
-static void layer_yuv_mulspec_c(
+static void layer_yuv_mulovr_c(
   BYTE* dstp8, BYTE* dstp8_u, BYTE* dstp8_v,
   const BYTE* ovrp8,
   const BYTE* maskp8,
@@ -753,7 +753,7 @@ static void layer_yuv_mulspec_c(
 
   // Phase 2: luma-only pass at full luma resolution.
   if constexpr (!lumaonly && maskMode != MASK444)
-    layer_yuv_mulspec_c<MASK444, pixel_t, true, has_alpha>(
+    layer_yuv_mulovr_c<MASK444, pixel_t, true, has_alpha>(
       dstp8, nullptr, nullptr,
       ovrp8, maskp8,
       dst_pitch, 0, overlay_pitch, mask_pitch,
@@ -763,7 +763,7 @@ static void layer_yuv_mulspec_c(
 // Float version — neutral UV = 0.0f in AviSynth+ float YUV, so both luma and chroma
 // collapse to the same formula: result = base * (1 - alpha_eff * (1 - ovr_Y)).
 template<MaskMode maskMode, bool lumaonly, bool has_alpha>
-static void layer_yuv_mulspec_f_c(
+static void layer_yuv_mulovr_f_c(
   BYTE* dstp8, BYTE* dstp8_u, BYTE* dstp8_v,
   const BYTE* ovrp8,
   const BYTE* maskp8,
@@ -839,54 +839,54 @@ static void layer_yuv_mulspec_f_c(
     mask_pitch *= sizeof(float);
 
   if constexpr (!lumaonly && maskMode != MASK444)
-    layer_yuv_mulspec_f_c<MASK444, true, has_alpha>(
+    layer_yuv_mulovr_f_c<MASK444, true, has_alpha>(
       dstp8, nullptr, nullptr,
       ovrp8, maskp8,
       dst_pitch, 0, overlay_pitch, mask_pitch,
       width, height, opacity);
 }
 
-static void get_layer_yuv_mulspec_functions(
+static void get_layer_yuv_mulovr_functions(
   bool has_alpha, int placement, VideoInfo& vi, int bits_per_pixel,
-  layer_yuv_mulspec_c_t**   layer_fn,
-  layer_yuv_mulspec_f_c_t** layer_f_fn)
+  layer_yuv_mulovr_c_t**   layer_fn,
+  layer_yuv_mulovr_f_c_t** layer_f_fn)
 {
-#define MULSPEC_DISPATCH(MaskType, lumaonly, ha) \
+#define MULOVR_DISPATCH(MaskType, lumaonly, ha) \
   { if (bits_per_pixel == 8) \
-    *layer_fn   = layer_yuv_mulspec_c  <MaskType, uint8_t,  lumaonly, ha>; \
+    *layer_fn   = layer_yuv_mulovr_c  <MaskType, uint8_t,  lumaonly, ha>; \
   else if (bits_per_pixel <= 16) \
-    *layer_fn   = layer_yuv_mulspec_c  <MaskType, uint16_t, lumaonly, ha>; \
+    *layer_fn   = layer_yuv_mulovr_c  <MaskType, uint16_t, lumaonly, ha>; \
   else \
-    *layer_f_fn = layer_yuv_mulspec_f_c<MaskType,           lumaonly, ha>; \
+    *layer_f_fn = layer_yuv_mulovr_f_c<MaskType,           lumaonly, ha>; \
   }
 
-#define MULSPEC_HA(MaskType, lumaonly) \
-  { if (has_alpha) { MULSPEC_DISPATCH(MaskType, lumaonly, true) } \
-    else           { MULSPEC_DISPATCH(MaskType, lumaonly, false) } }
+#define MULOVR_HA(MaskType, lumaonly) \
+  { if (has_alpha) { MULOVR_DISPATCH(MaskType, lumaonly, true) } \
+    else           { MULOVR_DISPATCH(MaskType, lumaonly, false) } }
 
   if (vi.IsY()) {
     // Greyscale: no UV planes — luma-only pass, identical to Layer "Mul" luma.
-    MULSPEC_HA(MASK444, true)
+    MULOVR_HA(MASK444, true)
   }
   else if (vi.IsYV411()) {
-    MULSPEC_DISPATCH(MASK411, false, false) // YV411 never has alpha
+    MULOVR_DISPATCH(MASK411, false, false) // YV411 never has alpha
   }
   else if (vi.Is420()) {
-    if      (placement == PLACEMENT_MPEG1)    { MULSPEC_HA(MASK420,         false) }
-    else if (placement == PLACEMENT_TOPLEFT)  { MULSPEC_HA(MASK420_TOPLEFT, false) }
-    else                                      { MULSPEC_HA(MASK420_MPEG2,   false) }
+    if      (placement == PLACEMENT_MPEG1)    { MULOVR_HA(MASK420,         false) }
+    else if (placement == PLACEMENT_TOPLEFT)  { MULOVR_HA(MASK420_TOPLEFT, false) }
+    else                                      { MULOVR_HA(MASK420_MPEG2,   false) }
   }
   else if (vi.Is422()) {
-    if      (placement == PLACEMENT_MPEG1)    { MULSPEC_HA(MASK422,         false) }
-    else if (placement == PLACEMENT_TOPLEFT)  { MULSPEC_HA(MASK422_TOPLEFT, false) }
-    else                                      { MULSPEC_HA(MASK422_MPEG2,   false) }
+    if      (placement == PLACEMENT_MPEG1)    { MULOVR_HA(MASK422,         false) }
+    else if (placement == PLACEMENT_TOPLEFT)  { MULOVR_HA(MASK422_TOPLEFT, false) }
+    else                                      { MULOVR_HA(MASK422_MPEG2,   false) }
   }
   else { // Is444() — cwidth == width, cheight == height; same-res, single pass
-    MULSPEC_HA(MASK444, false)
+    MULOVR_HA(MASK444, false)
   }
 
-#undef MULSPEC_HA
-#undef MULSPEC_DISPATCH
+#undef MULOVR_HA
+#undef MULOVR_DISPATCH
 }
 
 // both masked merge (HasAlpha) and plain add (no alpha)
