@@ -107,7 +107,7 @@ static AVS_FORCEINLINE void blend16_masked_sse41_row(
 // 4 pixels per step.
 // ---------------------------------------------------------------------------
 #if defined(GCC) || defined(CLANG)
-__attribute__((__target__("sse41")))
+__attribute__((__target__("sse4.1")))
 #endif
 static void blend_masked_float_sse41_row(
   float* p1, const float* p2, const float* mask, int width)
